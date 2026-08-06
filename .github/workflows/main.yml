@@ -1,1 +1,18 @@
+name: Run CI on Repository
+
+# Defines what events trigger this workflow
+on:
+  push:
+    branches: [ "main" ] # Runs whenever code is pushed to the main branch
+  workflow_dispatch:     # Enables you to manually click a button to run it
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4 # Downloads your repo code onto the runner
+        
+      - name: Run a Test Script
+        run: echo "GitHub Actions is successfully running on this repository!"
 
