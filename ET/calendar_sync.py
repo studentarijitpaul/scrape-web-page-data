@@ -1,4 +1,3 @@
-```python
 """
 calendar_sync.py
 
@@ -1183,4 +1182,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-```
+    
