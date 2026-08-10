@@ -249,15 +249,6 @@ def main() -> None:
         sys.exit(2)
     sys.exit(0)
 
-calendar_id = os.getenv('GOOGLE_CALENDAR_ID', '').strip()
-
-if not calendar_id:
-    print("[ERROR] GOOGLE_CALENDAR_ID is empty")
-    sys.exit(1)
-
-if len(calendar_id) != 92 or '@group.calendar.google.com' not in calendar_id:
-    print(f"[ERROR] Invalid GOOGLE_CALENDAR_ID format (got {len(calendar_id)} chars)")
-    sys.exit(1)
 
 if __name__ == "__main__":
     main()
