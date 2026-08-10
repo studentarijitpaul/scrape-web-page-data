@@ -1,0 +1,46 @@
+name: Sync Exam Calendar to Google Calendar
+
+on:
+  workflow_dispatch:
+    inputs:
+      delete_removed:
+        description: "Delete Calendar events no longer present in the Sheet"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+  schedule:
+    - cron: "30 23 * * *"   # 23:30 UTC = 05:00 AM IST daily
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    env:
+      TZ: Asia/Kolkata
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        working-directory: fileszip/fileszip
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Calendar sync
+        working-directory: fileszip/fileszip
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+          SYNC_TIMEZONE: Asia/Kolkata
+          DELETE_REMOVED_EVENTS: ${{ github.event.inputs.delete_removed || 'false' }}
+        run: python calendar_sync.py
