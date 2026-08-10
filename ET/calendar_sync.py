@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -83,6 +84,52 @@ def parse_row_date(date_str: str) -> Optional[date]:
         return datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
         return None
+
+
+def validate_and_clean_calendar_id(calendar_id: str) -> str:
+    """
+    Validate and clean the calendar ID.
+    
+    Google Calendar IDs typically look like:
+    - abc123def456@group.calendar.google.com
+    - c_abc123def456@group.calendar.google.com
+    
+    This function:
+    1. Strips whitespace and newlines
+    2. Removes any surrounding quotes
+    3. Validates it's not empty
+    4. Checks it contains @ (basic validation)
+    
+    Returns the cleaned ID or raises RuntimeError with details.
+    """
+    if not calendar_id:
+        raise RuntimeError("GOOGLE_CALENDAR_ID environment variable is not set.")
+    
+    # Strip all types of whitespace (spaces, tabs, newlines, etc.)
+    cleaned = calendar_id.strip()
+    
+    # Remove surrounding quotes if present (handles both single and double)
+    cleaned = re.sub(r'^["\']|["\']$', '', cleaned)
+    
+    # Strip again after quote removal
+    cleaned = cleaned.strip()
+    
+    if not cleaned:
+        raise RuntimeError(
+            "GOOGLE_CALENDAR_ID is empty after stripping whitespace and quotes. "
+            "Please set a valid Google Calendar ID (e.g., abc123@group.calendar.google.com)."
+        )
+    
+    if "@" not in cleaned:
+        raise RuntimeError(
+            f"GOOGLE_CALENDAR_ID appears invalid (missing @): {cleaned[:20]}... "
+            "Expected format: abc123@group.calendar.google.com"
+        )
+    
+    # Log the cleaned ID (last 10 chars to avoid exposing full ID)
+    log.debug(f"Calendar ID validated (ends with: ...{cleaned[-10:]})")
+    
+    return cleaned
 
 
 def row_to_event_body(row: dict) -> dict:
@@ -174,9 +221,7 @@ def delete_event(service, calendar_id: str, event_id: str) -> None:
 def run_sync() -> SyncStats:
     stats = SyncStats()
 
-    calendar_id = (os.environ.get("GOOGLE_CALENDAR_ID") or "").strip()
-    if not calendar_id:
-        raise RuntimeError("GOOGLE_CALENDAR_ID environment variable is not set.")
+    calendar_id = validate_and_clean_calendar_id(os.environ.get("GOOGLE_CALENDAR_ID", ""))
 
     tab_name = os.environ.get("SHEET_TAB_NAME") or None
     delete_removed = os.environ.get("DELETE_REMOVED_EVENTS", "false").strip().lower() == "true"
