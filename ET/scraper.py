@@ -1,52 +1,90 @@
-from __future__ import annotations
+"""
+Shiksha Exam Calendar Scraper
+=============================
 
-import hashlib
-import logging
+Purpose:
+    Scrape exam calendar data from Shiksha and write it to Google Sheets.
+
+Google Calendar is intentionally NOT handled by this script.
+Google Calendar synchronization should be handled separately by:
+
+    calendar_sync.py
+
+Required environment variables:
+    GOOGLE_SERVICE_ACCOUNT_JSON
+    GOOGLE_SHEET_ID
+
+Optional environment variables:
+    TARGET_MONTH
+    SHIKSHA_URL
+
+Example:
+    TARGET_MONTH="August 2026" python scraper.py
+
+GitHub Actions:
+    GOOGLE_SERVICE_ACCOUNT_JSON=${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+    GOOGLE_SHEET_ID=${{ secrets.GOOGLE_SHEET_ID }}
+"""
+
 import os
-import re
 import sys
+import json
 import time
 import random
+import logging
+from datetime import datetime
+from typing import List, Dict, Optional
 
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from typing import Optional
+import gspread
+from google.oauth2.service_account import Credentials
 
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-
-from google_sheets import get_credentials, read_all_rows
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-DEFAULT_TIMEZONE = "Asia/Kolkata"
+SHIKSHA_URL = os.getenv(
+    "SHIKSHA_URL",
+    "https://www.shiksha.com/engineering/resources/exam-calendar"
+)
 
-SYNC_SOURCE_TAG = "shiksha_exam_sync"
+TARGET_MONTH = os.getenv(
+    "TARGET_MONTH",
+    "August 2026"
+)
 
-# Google Calendar custom event IDs may contain:
-# a-v and 0-9
-EVENT_ID_PREFIX = "evt"
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 
-# Number of retries for rate-limit/server errors
-MAX_RETRIES = 7
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv(
+    "GOOGLE_SERVICE_ACCOUNT_JSON",
+    ""
+).strip()
 
-# Base retry delay.
-# Actual delay uses exponential backoff + jitter.
-BASE_RETRY_DELAY = 2
+# Google Sheet worksheet/tab where data will be written.
+OUTPUT_WORKSHEET = os.getenv(
+    "OUTPUT_WORKSHEET",
+    "Exam Calendar"
+)
 
-# Maximum retry delay
-MAX_RETRY_DELAY = 60
+# Whether to clear the existing worksheet before writing.
+CLEAR_SHEET = os.getenv(
+    "CLEAR_SHEET",
+    "true"
+).lower() == "true"
 
-# Small delay between successful API operations.
-# This helps prevent rate limiting.
-MIN_OPERATION_DELAY = 0.8
-MAX_OPERATION_DELAY = 1.8
+# Browser settings
+HEADLESS = True
 
-# Calendar name to prefer when automatically detecting
-TARGET_CALENDAR_NAME = "eng"
+PAGE_TIMEOUT = 60_000
+
+# Random delay settings
+MIN_DELAY = 1.0
+MAX_DELAY = 3.0
 
 
 # ============================================================
@@ -58,1313 +96,1150 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-log = logging.getLogger("calendar_sync")
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# SYNC STATISTICS
+# UTILITY FUNCTIONS
 # ============================================================
 
-@dataclass
-class SyncStats:
+def random_delay(
+    minimum: float = MIN_DELAY,
+    maximum: float = MAX_DELAY
+) -> None:
+    """
+    Sleep for a random amount of time.
+    """
 
-    created: int = 0
-    updated: int = 0
-    skipped: int = 0
-    deleted: int = 0
-    failed: int = 0
+    delay = random.uniform(minimum, maximum)
 
-    def summary(self) -> str:
+    logger.debug(
+        "Waiting %.2f seconds...",
+        delay
+    )
 
-        return (
-            f"created={self.created} "
-            f"updated={self.updated} "
-            f"skipped={self.skipped} "
-            f"deleted={self.deleted} "
-            f"failed={self.failed}"
+    time.sleep(delay)
+
+
+def validate_configuration() -> None:
+    """
+    Validate required environment variables.
+
+    IMPORTANT:
+        This function intentionally does NOT check
+        GOOGLE_CALENDAR_ID because scraper.py does not
+        interact with Google Calendar.
+    """
+
+    missing = []
+
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        missing.append("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+    if not GOOGLE_SHEET_ID:
+        missing.append("GOOGLE_SHEET_ID")
+
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variable(s): "
+            + ", ".join(missing)
         )
 
 
-# ============================================================
-# RATE LIMIT / RETRY HELPERS
-# ============================================================
-
-def is_retryable_http_error(error: HttpError) -> bool:
+def parse_target_month(target_month: str):
     """
-    Determine whether a Google API error should be retried.
-
-    Retry:
-        403 rateLimitExceeded
-        403 userRateLimitExceeded
-        403 quotaExceeded
-        429 Too Many Requests
-        500
-        502
-        503
-        504
-
-    Do not retry ordinary errors such as:
-        400
-        401
-        404
-        409
-        etc.
+    Convert 'August 2026' into a datetime object.
     """
 
     try:
-        status = int(error.resp.status)
-    except Exception:
-        return False
-
-    if status in (429, 500, 502, 503, 504):
-        return True
-
-    if status != 403:
-        return False
-
-    try:
-        content = error.content.decode("utf-8", errors="ignore").lower()
-    except Exception:
-        content = str(error).lower()
-
-    retry_reasons = (
-        "ratelimitexceeded",
-        "userratelimitexceeded",
-        "quotaexceeded",
-        "backenderror",
-    )
-
-    return any(
-        reason in content
-        for reason in retry_reasons
-    )
-
-
-def retry_delay(attempt: int) -> float:
-    """
-    Exponential backoff with jitter.
-
-    attempt=1 -> roughly 2 sec
-    attempt=2 -> roughly 4 sec
-    attempt=3 -> roughly 8 sec
-    ...
-    """
-
-    delay = min(
-        BASE_RETRY_DELAY * (2 ** (attempt - 1)),
-        MAX_RETRY_DELAY,
-    )
-
-    # Add random jitter so repeated jobs do not
-    # all hit the API at exactly the same time.
-    jitter = random.uniform(0.5, 1.5)
-
-    return delay * jitter
-
-
-def execute_with_retry(
-    request_factory,
-    operation_name: str,
-):
-    """
-    Execute a Google API request with exponential backoff.
-
-    request_factory must be a function that returns
-    a fresh Google API request object.
-
-    Example:
-
-        execute_with_retry(
-            lambda: service.events().get(...),
-            "get event"
+        return datetime.strptime(
+            target_month.strip(),
+            "%B %Y"
         )
-    """
 
-    for attempt in range(1, MAX_RETRIES + 1):
-
-        try:
-
-            result = request_factory().execute()
-
-            # Small delay after every successful operation.
-            time.sleep(
-                random.uniform(
-                    MIN_OPERATION_DELAY,
-                    MAX_OPERATION_DELAY,
-                )
-            )
-
-            return result
-
-        except HttpError as error:
-
-            if not is_retryable_http_error(error):
-
-                raise
-
-            if attempt >= MAX_RETRIES:
-
-                log.error(
-                    "Google API operation failed after %d retries: %s",
-                    MAX_RETRIES,
-                    operation_name,
-                )
-
-                raise
-
-            delay = retry_delay(attempt)
-
-            log.warning(
-                "Google API rate/server limit during '%s'. "
-                "Retry %d/%d in %.1f seconds.",
-                operation_name,
-                attempt,
-                MAX_RETRIES,
-                delay,
-            )
-
-            time.sleep(delay)
-
-
-# ============================================================
-# EVENT ID
-# ============================================================
-
-def make_event_id(
-    exam: str,
-    date_str: str,
-    event_type: str,
-) -> str:
-    """
-    Generate a deterministic Google Calendar event ID.
-
-    The same:
-        exam + date + event type
-
-    will always generate the same event ID.
-
-    This allows the script to UPDATE an existing event
-    instead of creating duplicates.
-
-    Google Calendar custom IDs must contain only:
-        a-v
-        0-9
-    """
-
-    key = (
-        f"{exam.strip().lower()}|"
-        f"{date_str.strip()}|"
-        f"{event_type.strip().lower()}"
-    )
-
-    digest = hashlib.sha256(
-        key.encode("utf-8")
-    ).hexdigest()
-
-    event_id = f"{EVENT_ID_PREFIX}{digest}"
-
-    # Google Calendar allowed characters:
-    # a-v and 0-9
-    if not re.fullmatch(
-        r"[a-v0-9]{5,1024}",
-        event_id,
-    ):
+    except ValueError:
         raise ValueError(
-            f"Generated invalid Google Calendar event ID: "
-            f"{event_id}"
+            f"Invalid TARGET_MONTH: '{target_month}'. "
+            "Expected format: 'August 2026'."
         )
 
-    return event_id
-
 
 # ============================================================
-# DATE PARSER
+# GOOGLE SHEETS
 # ============================================================
 
-def parse_row_date(
-    date_str: str,
-) -> Optional[date]:
+def get_google_credentials():
     """
-    Convert supported date strings into date objects.
-
-    Primary format:
-        YYYY-MM-DD
-
-    Also supports common formats just in case.
+    Create Google service-account credentials.
     """
 
-    date_str = (
-        date_str or ""
-    ).strip()
+    try:
+        credentials_info = json.loads(
+            GOOGLE_SERVICE_ACCOUNT_JSON
+        )
 
-    if not date_str:
-        return None
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON."
+        ) from exc
 
-    formats = (
-        "%Y-%m-%d",
-        "%d-%m-%Y",
-        "%d/%m/%Y",
-        "%Y/%m/%d",
-        "%d %B %Y",
-        "%d %b %Y",
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    credentials = Credentials.from_service_account_info(
+        credentials_info,
+        scopes=scopes,
     )
 
-    for fmt in formats:
+    return credentials
+
+
+def connect_to_google_sheet():
+    """
+    Connect to the Google Sheet.
+    """
+
+    logger.info("Connecting to Google Sheets...")
+
+    credentials = get_google_credentials()
+
+    client = gspread.authorize(credentials)
+
+    spreadsheet = client.open_by_key(
+        GOOGLE_SHEET_ID
+    )
+
+    logger.info(
+        "Connected to Google Sheet: %s",
+        spreadsheet.title
+    )
+
+    return spreadsheet
+
+
+def get_or_create_worksheet(spreadsheet):
+    """
+    Get the configured worksheet.
+
+    If it doesn't exist, create it.
+    """
+
+    try:
+        worksheet = spreadsheet.worksheet(
+            OUTPUT_WORKSHEET
+        )
+
+        logger.info(
+            "Using existing worksheet: %s",
+            OUTPUT_WORKSHEET
+        )
+
+        return worksheet
+
+    except gspread.WorksheetNotFound:
+
+        logger.info(
+            "Worksheet '%s' not found. Creating it...",
+            OUTPUT_WORKSHEET
+        )
+
+        worksheet = spreadsheet.add_worksheet(
+            title=OUTPUT_WORKSHEET,
+            rows=1000,
+            cols=10,
+        )
+
+        return worksheet
+
+
+def write_to_google_sheet(
+    rows: List[Dict[str, str]]
+) -> None:
+    """
+    Write scraped rows to Google Sheets.
+    """
+
+    spreadsheet = connect_to_google_sheet()
+
+    worksheet = get_or_create_worksheet(
+        spreadsheet
+    )
+
+    if CLEAR_SHEET:
+        logger.info(
+            "Clearing worksheet..."
+        )
+
+        worksheet.clear()
+
+    # --------------------------------------------------------
+    # HEADER
+    # --------------------------------------------------------
+
+    headers = [
+        "date",
+        "label",
+        "Event",
+    ]
+
+    values = [headers]
+
+    # --------------------------------------------------------
+    # DATA
+    # --------------------------------------------------------
+
+    for row in rows:
+
+        values.append([
+            row.get("date", ""),
+            row.get("label", ""),
+            row.get("Event", ""),
+        ])
+
+    logger.info(
+        "Writing %d row(s) to Google Sheet...",
+        len(rows)
+    )
+
+    # Use a single update request rather than updating
+    # each cell individually.
+    worksheet.update(
+        values,
+        "A1:C{}".format(len(values)),
+    )
+
+    logger.info(
+        "Google Sheet updated successfully."
+    )
+
+    logger.info(
+        "Total rows written: %d",
+        len(rows)
+    )
+
+
+# ============================================================
+# PLAYWRIGHT
+# ============================================================
+
+def launch_browser(playwright):
+    """
+    Launch Chromium.
+    """
+
+    logger.info(
+        "Launching headless Chromium..."
+    )
+
+    browser = playwright.chromium.launch(
+        headless=HEADLESS,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    )
+
+    return browser
+
+
+def create_browser_context(browser):
+    """
+    Create a browser context.
+    """
+
+    context = browser.new_context(
+        viewport={
+            "width": 1440,
+            "height": 900,
+        },
+        locale="en-IN",
+        timezone_id="Asia/Kolkata",
+        user_agent=(
+            "Mozilla/5.0 "
+            "(X11; Linux x86_64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/151.0.0.0 "
+            "Safari/537.36"
+        ),
+    )
+
+    return context
+
+
+# ============================================================
+# PAGE LOADING
+# ============================================================
+
+def load_shiksha_page(page) -> None:
+    """
+    Load the Shiksha exam calendar page.
+    """
+
+    logger.info(
+        "Fetching [%s] ...",
+        SHIKSHA_URL
+    )
+
+    try:
+
+        response = page.goto(
+            SHIKSHA_URL,
+            wait_until="domcontentloaded",
+            timeout=PAGE_TIMEOUT,
+        )
+
+        if response:
+            logger.info(
+                "HTTP status: %s",
+                response.status
+            )
+
+        random_delay()
+
+    except PlaywrightTimeoutError:
+
+        logger.warning(
+            "Page load timed out. "
+            "Continuing because the page may still be usable."
+        )
+
+    except Exception as exc:
+
+        logger.error(
+            "Failed to load Shiksha page: %s",
+            exc
+        )
+
+        raise
+
+
+def wait_for_page_content(page) -> None:
+    """
+    Wait for useful page content.
+    """
+
+    logger.info(
+        "Waiting for calendar/page content..."
+    )
+
+    try:
+
+        page.wait_for_load_state(
+            "networkidle",
+            timeout=30_000,
+        )
+
+    except PlaywrightTimeoutError:
+
+        logger.warning(
+            "networkidle timeout. "
+            "Continuing with available page content."
+        )
+
+    random_delay()
+
+
+# ============================================================
+# CALENDAR DISCOVERY
+# ============================================================
+
+def find_calendar_container(page) -> Optional[object]:
+    """
+    Try to find the calendar container.
+
+    Shiksha may change its HTML structure, so several
+    selectors are attempted.
+    """
+
+    selectors = [
+        ".fc",
+        ".fc-view-harness",
+        ".fc-view",
+        "[class*='calendar']",
+        "[id*='calendar']",
+    ]
+
+    for selector in selectors:
 
         try:
 
-            return datetime.strptime(
-                date_str,
-                fmt,
-            ).date()
+            locator = page.locator(
+                selector
+            ).first
 
-        except ValueError:
+            if locator.count() > 0:
+
+                logger.info(
+                    "Calendar container found using selector: %s",
+                    selector
+                )
+
+                return locator
+
+        except Exception:
             continue
+
+    logger.warning(
+        "No obvious calendar container found."
+    )
 
     return None
 
 
 # ============================================================
-# GOOGLE CALENDAR SERVICE
+# FULLCALENDAR EXTRACTION
 # ============================================================
 
-def build_calendar_service():
-
+def extract_fullcalendar_events(page) -> List[Dict[str, str]]:
     """
-    Build Google Calendar API service using the
-    credentials provided by google_sheets.py.
-    """
+    Attempt to extract events directly from FullCalendar.
 
-    creds = get_credentials()
-
-    if creds is None:
-
-        raise RuntimeError(
-            "Google credentials could not be loaded."
-        )
-
-    service = build(
-        "calendar",
-        "v3",
-        credentials=creds,
-        cache_discovery=False,
-    )
-
-    return service
-
-
-# ============================================================
-# AUTOMATIC CALENDAR DETECTION
-# ============================================================
-
-def get_calendar_id(
-    service,
-) -> str:
-    """
-    Get Google Calendar ID.
-
-    Priority:
-
-    1. GOOGLE_CALENDAR_ID environment variable
-    2. Calendar named 'eng'
-    3. First writable calendar
-
-    This is important because the previous working
-    version automatically detected the calendar.
+    This uses the browser page's JavaScript context.
     """
 
-    # --------------------------------------------------------
-    # 1. Environment variable
-    # --------------------------------------------------------
-
-    calendar_id = os.getenv(
-        "GOOGLE_CALENDAR_ID",
-        "",
-    ).strip()
-
-    if calendar_id:
-
-        log.info(
-            "Using GOOGLE_CALENDAR_ID from environment."
-        )
-
-        log.info(
-            "Calendar ID detected: %s",
-            calendar_id,
-        )
-
-        return calendar_id
-
-    # --------------------------------------------------------
-    # 2. Automatically list calendars
-    # --------------------------------------------------------
-
-    log.info(
-        "GOOGLE_CALENDAR_ID not configured."
+    logger.info(
+        "Attempting FullCalendar event extraction..."
     )
 
-    log.info(
-        "Attempting automatic calendar detection..."
-    )
+    script = """
+    () => {
+        const results = [];
 
-    calendars = []
+        // ----------------------------------------------------
+        // Look for common FullCalendar instances.
+        // ----------------------------------------------------
 
-    page_token = None
+        const elements = document.querySelectorAll(
+            '.fc, .fc-view-harness, [class*="calendar"]'
+        );
 
-    while True:
+        // ----------------------------------------------------
+        // Read rendered event elements.
+        // ----------------------------------------------------
 
-        response = execute_with_retry(
-            lambda: service.calendarList().list(
-                pageToken=page_token,
-                minAccessRole="writer",
-            ),
-            "list calendars",
-        )
+        const eventElements = document.querySelectorAll(
+            '.fc-event, .fc-daygrid-event, .fc-timegrid-event'
+        );
 
-        calendars.extend(
-            response.get(
-                "items",
-                [],
-            )
-        )
+        for (const element of eventElements) {
 
-        page_token = response.get(
-            "nextPageToken"
-        )
+            const text = (element.innerText || '').trim();
 
-        if not page_token:
-            break
-
-    if not calendars:
-
-        raise RuntimeError(
-            "No writable Google Calendars were found. "
-            "Make sure the service account has access "
-            "to the calendar."
-        )
-
-    # --------------------------------------------------------
-    # Log calendars
-    # --------------------------------------------------------
-
-    log.info(
-        "Found %d writable calendar(s).",
-        len(calendars),
-    )
-
-    for calendar in calendars:
-
-        log.info(
-            "Available calendar: %s | ID: %s",
-            calendar.get(
-                "summary",
-                "Unnamed",
-            ),
-            calendar.get(
-                "id",
-                "",
-            ),
-        )
-
-    # --------------------------------------------------------
-    # 3. Prefer "eng"
-    # --------------------------------------------------------
-
-    for calendar in calendars:
-
-        name = (
-            calendar.get(
-                "summary",
-                "",
-            )
-            .strip()
-            .lower()
-        )
-
-        if name == TARGET_CALENDAR_NAME.lower():
-
-            calendar_id = calendar.get("id")
-
-            if calendar_id:
-
-                log.info(
-                    "Calendar ID detected: %s",
-                    calendar_id,
-                )
-
-                return calendar_id
-
-    # --------------------------------------------------------
-    # 4. Fallback to first writable calendar
-    # --------------------------------------------------------
-
-    for calendar in calendars:
-
-        calendar_id = calendar.get("id")
-
-        if calendar_id:
-
-            log.warning(
-                "Calendar '%s' was not found.",
-                TARGET_CALENDAR_NAME,
-            )
-
-            log.info(
-                "Using first writable calendar: %s",
-                calendar.get(
-                    "summary",
-                    "Unnamed",
-                ),
-            )
-
-            log.info(
-                "Calendar ID detected: %s",
-                calendar_id,
-            )
-
-            return calendar_id
-
-    raise RuntimeError(
-        "Could not determine a valid Google Calendar ID."
-    )
-
-
-# ============================================================
-# TEST CALENDAR ACCESS
-# ============================================================
-
-def test_calendar_access(
-    service,
-    calendar_id: str,
-):
-    """
-    Test whether the service account can access
-    the specified Google Calendar.
-    """
-
-    log.info(
-        "Testing Google Calendar access..."
-    )
-
-    try:
-
-        calendar = execute_with_retry(
-            lambda: service.calendars().get(
-                calendarId=calendar_id,
-            ),
-            "test calendar access",
-        )
-
-    except HttpError as error:
-
-        raise RuntimeError(
-            f"Unable to access Google Calendar: {error}"
-        )
-
-    log.info(
-        "Google Calendar connection successful!"
-    )
-
-    log.info(
-        "Calendar name: %s",
-        calendar.get(
-            "summary",
-            "Unknown",
-        ),
-    )
-
-    log.info(
-        "Calendar timezone: %s",
-        calendar.get(
-            "timeZone",
-            DEFAULT_TIMEZONE,
-        ),
-    )
-
-
-# ============================================================
-# ROW -> GOOGLE CALENDAR EVENT
-# ============================================================
-
-def row_to_event_body(
-    row: dict,
-) -> dict:
-    """
-    Convert a Google Sheet row into a Google Calendar
-    all-day event.
-    """
-
-    date_str = str(
-        row.get(
-            "date",
-            "",
-        )
-    ).strip()
-
-    d = parse_row_date(
-        date_str
-    )
-
-    if d is None:
-
-        raise ValueError(
-            f"Invalid date: {date_str}"
-        )
-
-    # Google Calendar all-day event end date
-    # is EXCLUSIVE.
-    end = d + timedelta(
-        days=1
-    )
-
-    exam = str(
-        row.get(
-            "exam",
-            "",
-        )
-    ).strip()
-
-    event_type = str(
-        row.get(
-            "Event",
-            row.get(
-                "event",
-                "",
-            ),
-        )
-    ).strip()
-
-    label = str(
-        row.get(
-            "label",
-            "",
-        )
-    ).strip()
-
-    description_lines = []
-
-    if exam:
-        description_lines.append(
-            f"Exam: {exam}"
-        )
-
-    if label:
-        description_lines.append(
-            f"Label: {label}"
-        )
-
-    if event_type:
-        description_lines.append(
-            f"Event: {event_type}"
-        )
-
-    # Add remaining columns to description.
-    used_fields = {
-        "date",
-        "exam",
-        "label",
-        "Event",
-        "event",
-    }
-
-    for key, value in row.items():
-
-        if key in used_fields:
-            continue
-
-        if value is None:
-            continue
-
-        value = str(value).strip()
-
-        if not value:
-            continue
-
-        description_lines.append(
-            f"{key}: {value}"
-        )
-
-    description_lines.append(
-        f"Source: {SYNC_SOURCE_TAG}"
-    )
-
-    description = "\n".join(
-        description_lines
-    )
-
-    summary_parts = []
-
-    if exam:
-        summary_parts.append(exam)
-
-    if event_type:
-        summary_parts.append(
-            event_type
-        )
-
-    if label:
-        summary_parts.append(
-            label
-        )
-
-    summary = " - ".join(
-        summary_parts
-    )
-
-    if not summary:
-        summary = "Exam Calendar Event"
-
-    body = {
-        "summary": summary,
-
-        "description": description,
-
-        "start": {
-            "date": d.isoformat(),
-        },
-
-        "end": {
-            "date": end.isoformat(),
-        },
-
-        "extendedProperties": {
-            "private": {
-                "sync_source": SYNC_SOURCE_TAG,
+            if (!text) {
+                continue;
             }
-        },
+
+            let date = '';
+
+            const parent = element.closest(
+                '[data-date]'
+            );
+
+            if (parent) {
+                date = parent.getAttribute(
+                    'data-date'
+                ) || '';
+            }
+
+            if (!date) {
+                const dayCell = element.closest(
+                    '.fc-daygrid-day'
+                );
+
+                if (dayCell) {
+                    date = dayCell.getAttribute(
+                        'data-date'
+                    ) || '';
+                }
+            }
+
+            results.push({
+                date: date,
+                label: text,
+                Event: text
+            });
+        }
+
+        return results;
     }
-
-    return body
-
-
-# ============================================================
-# CREATE / UPDATE EVENT
-# ============================================================
-
-def upsert_event(
-    service,
-    calendar_id: str,
-    event_id: str,
-    body: dict,
-) -> str:
     """
-    Create an event.
-
-    If the event already exists, update it.
-
-    Returns:
-        "created"
-        "updated"
-    """
-
-    # --------------------------------------------------------
-    # First try to UPDATE the deterministic event ID.
-    # --------------------------------------------------------
 
     try:
 
-        execute_with_retry(
-            lambda: service.events().update(
-                calendarId=calendar_id,
-                eventId=event_id,
-                body=body,
-            ),
-            "update event",
+        events = page.evaluate(
+            script
         )
 
-        return "updated"
+    except Exception as exc:
 
-    except HttpError as error:
+        logger.warning(
+            "JavaScript event extraction failed: %s",
+            exc
+        )
 
-        # 404 means the event does not exist.
+        return []
+
+    if not isinstance(events, list):
+
+        return []
+
+    logger.info(
+        "Raw rendered calendar events found: %d",
+        len(events)
+    )
+
+    return events
+
+
+# ============================================================
+# DOM FALLBACK EXTRACTION
+# ============================================================
+
+def extract_dom_events(page) -> List[Dict[str, str]]:
+    """
+    Fallback extraction from visible calendar DOM.
+    """
+
+    logger.info(
+        "Trying DOM fallback extraction..."
+    )
+
+    events = []
+
+    selectors = [
+        ".fc-event",
+        ".fc-daygrid-event",
+        ".fc-event-title",
+        "[class*='event']",
+    ]
+
+    for selector in selectors:
+
         try:
-            status = int(
-                error.resp.status
+
+            locator = page.locator(
+                selector
             )
-        except Exception:
-            status = 0
 
-        if status != 404:
+            count = locator.count()
 
-            # 409 can happen if another operation created
-            # the same deterministic ID.
-            if status == 409:
+            if count == 0:
+                continue
+
+            logger.info(
+                "Found %d elements using %s",
+                count,
+                selector
+            )
+
+            for index in range(count):
 
                 try:
 
-                    execute_with_retry(
-                        lambda: service.events().update(
-                            calendarId=calendar_id,
-                            eventId=event_id,
-                            body=body,
-                        ),
-                        "resolve conflicting event",
+                    element = locator.nth(index)
+
+                    text = (
+                        element.inner_text()
+                        .strip()
                     )
 
-                    return "updated"
+                    if not text:
+                        continue
 
-                except HttpError:
-                    raise
+                    date = ""
 
-            raise
+                    try:
 
-    # --------------------------------------------------------
-    # Event does not exist -> INSERT
-    # --------------------------------------------------------
+                        date = element.evaluate(
+                            """
+                            el => {
+                                const parent =
+                                    el.closest('[data-date]');
+                                return parent
+                                    ? parent.getAttribute('data-date')
+                                    : '';
+                            }
+                            """
+                        )
+
+                    except Exception:
+                        pass
+
+                    events.append({
+                        "date": date or "",
+                        "label": text,
+                        "Event": text,
+                    })
+
+                except Exception:
+                    continue
+
+            if events:
+                break
+
+        except Exception:
+            continue
+
+    logger.info(
+        "Fallback events found: %d",
+        len(events)
+    )
+
+    return events
+
+
+# ============================================================
+# TEXT FALLBACK
+# ============================================================
+
+def extract_calendar_text(page) -> List[Dict[str, str]]:
+    """
+    Last-resort extraction.
+
+    This captures visible text from the calendar area.
+    """
+
+    logger.info(
+        "Trying text-based calendar extraction..."
+    )
+
+    results = []
+
+    container = find_calendar_container(
+        page
+    )
+
+    if container is None:
+
+        return results
 
     try:
 
-        execute_with_retry(
-            lambda: service.events().insert(
-                calendarId=calendar_id,
-                body=body,
-                sendUpdates="none",
-            ),
-            "create event",
+        text = container.inner_text()
+
+        if text.strip():
+
+            lines = [
+                line.strip()
+                for line in text.splitlines()
+                if line.strip()
+            ]
+
+            for line in lines:
+
+                results.append({
+                    "date": "",
+                    "label": line,
+                    "Event": line,
+                })
+
+    except Exception as exc:
+
+        logger.warning(
+            "Text extraction failed: %s",
+            exc
         )
 
-        return "created"
-
-    except HttpError as error:
-
-        # If another process created it between GET/INSERT,
-        # try update once.
-        try:
-            status = int(
-                error.resp.status
-            )
-        except Exception:
-            status = 0
-
-        if status == 409:
-
-            execute_with_retry(
-                lambda: service.events().update(
-                    calendarId=calendar_id,
-                    eventId=event_id,
-                    body=body,
-                ),
-                "update after conflict",
-            )
-
-            return "updated"
-
-        raise
+    return results
 
 
 # ============================================================
-# DELETE EVENT
+# DATE NORMALIZATION
 # ============================================================
 
-def delete_event(
-    service,
-    calendar_id: str,
-    event_id: str,
-):
+def normalize_date(value: str) -> str:
     """
-    Delete a Google Calendar event.
+    Normalize dates where possible.
 
-    404 means the event is already gone,
-    so it is ignored.
+    Output:
+        YYYY-MM-DD
+
+    If the value cannot be parsed, the original
+    value is returned.
     """
 
-    try:
+    if not value:
+        return ""
 
-        execute_with_retry(
-            lambda: service.events().delete(
-                calendarId=calendar_id,
-                eventId=event_id,
-            ),
-            "delete event",
-        )
+    value = value.strip()
 
-    except HttpError as error:
+    formats = [
+        "%Y-%m-%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%d %B %Y",
+        "%d %b %Y",
+        "%B %d, %Y",
+        "%b %d, %Y",
+    ]
+
+    for fmt in formats:
 
         try:
-            status = int(
-                error.resp.status
+
+            parsed = datetime.strptime(
+                value,
+                fmt
             )
-        except Exception:
-            status = 0
 
-        # Already deleted.
-        if status == 404:
-            return
+            return parsed.strftime(
+                "%Y-%m-%d"
+            )
 
-        raise
+        except ValueError:
+            continue
+
+    return value
 
 
 # ============================================================
-# FIND EXISTING SYNC EVENTS
+# MONTH FILTER
 # ============================================================
 
-def list_existing_synced_event_ids(
-    service,
-    calendar_id: str,
-) -> set[str]:
+def filter_target_month(
+    events: List[Dict[str, str]],
+    target_month: str
+) -> List[Dict[str, str]]:
     """
-    Find all events previously created by this
-    synchronization script.
-
-    Uses extendedProperties instead of searching the
-    description manually.
+    Filter events belonging to TARGET_MONTH.
     """
 
-    ids = set()
+    target_date = parse_target_month(
+        target_month
+    )
 
-    page_token = None
+    target_year = target_date.year
+    target_month_number = target_date.month
 
-    while True:
+    filtered = []
 
-        response = execute_with_retry(
-            lambda: service.events().list(
-                calendarId=calendar_id,
-                privateExtendedProperty=(
-                    f"sync_source={SYNC_SOURCE_TAG}"
-                ),
-                showDeleted=False,
-                singleEvents=True,
-                maxResults=2500,
-                pageToken=page_token,
-            ),
-            "list synced events",
+    for event in events:
+
+        date_value = normalize_date(
+            event.get("date", "")
         )
 
-        for event in response.get(
-            "items",
-            [],
+        if not date_value:
+            continue
+
+        try:
+
+            event_date = datetime.strptime(
+                date_value,
+                "%Y-%m-%d"
+            )
+
+        except ValueError:
+
+            continue
+
+        if (
+            event_date.year == target_year
+            and event_date.month == target_month_number
         ):
 
-            event_id = event.get("id")
+            filtered.append({
+                "date": event_date.strftime(
+                    "%Y-%m-%d"
+                ),
+                "label": event.get(
+                    "label",
+                    ""
+                ).strip(),
+                "Event": event.get(
+                    "Event",
+                    ""
+                ).strip(),
+            })
 
-            if event_id:
-                ids.add(event_id)
+    logger.info(
+        "Events after %s filtering: %d",
+        target_month,
+        len(filtered)
+    )
 
-        page_token = response.get(
-            "nextPageToken"
-        )
-
-        if not page_token:
-            break
-
-    return ids
+    return filtered
 
 
 # ============================================================
-# MAIN SYNC
+# CLEAN DATA
 # ============================================================
 
-def run_sync():
+def clean_events(
+    events: List[Dict[str, str]]
+) -> List[Dict[str, str]]:
+    """
+    Remove empty and duplicate events.
+    """
 
-    # --------------------------------------------------------
-    # Read Google Sheet
-    # --------------------------------------------------------
+    cleaned = []
 
-    log.info(
-        "Reading rows (all tabs) from Google Sheet..."
-    )
+    seen = set()
 
-    rows = read_all_rows()
+    for event in events:
 
-    log.info(
-        "Read %d row(s).",
-        len(rows),
-    )
+        date = event.get(
+            "date",
+            ""
+        ).strip()
 
-    if not rows:
+        label = event.get(
+            "label",
+            ""
+        ).strip()
 
-        log.warning(
-            "No rows found in Google Sheet."
+        event_name = event.get(
+            "Event",
+            ""
+        ).strip()
+
+        if not date and not label and not event_name:
+            continue
+
+        key = (
+            date,
+            label,
+            event_name,
         )
 
-        return SyncStats()
+        if key in seen:
+            continue
 
-    # --------------------------------------------------------
-    # Build Calendar service
-    # --------------------------------------------------------
+        seen.add(key)
 
-    service = build_calendar_service()
+        cleaned.append({
+            "date": date,
+            "label": label,
+            "Event": event_name,
+        })
 
-    # --------------------------------------------------------
-    # Detect Calendar automatically
-    # --------------------------------------------------------
-
-    calendar_id = get_calendar_id(
-        service
-    )
-
-    # --------------------------------------------------------
-    # Test Calendar
-    # --------------------------------------------------------
-
-    test_calendar_access(
-        service,
-        calendar_id,
-    )
-
-    # --------------------------------------------------------
-    # Configuration
-    # --------------------------------------------------------
-
-    delete_removed = (
-        os.getenv(
-            "DELETE_REMOVED_EVENTS",
-            "false",
-        )
-        .strip()
-        .lower()
-        in (
-            "1",
-            "true",
-            "yes",
-            "on",
+    cleaned.sort(
+        key=lambda x: (
+            x["date"],
+            x["label"],
+            x["Event"],
         )
     )
 
-    if delete_removed:
+    return cleaned
 
-        log.info(
-            "DELETE_REMOVED_EVENTS enabled."
+
+# ============================================================
+# SCRAPE
+# ============================================================
+
+def scrape_shiksha() -> List[Dict[str, str]]:
+    """
+    Main scraping function.
+    """
+
+    logger.info(
+        "=================================================="
+    )
+
+    logger.info(
+        "Shiksha Exam Calendar Scraper"
+    )
+
+    logger.info(
+        "Target month: %s",
+        TARGET_MONTH
+    )
+
+    logger.info(
+        "=================================================="
+    )
+
+    with sync_playwright() as playwright:
+
+        browser = launch_browser(
+            playwright
         )
 
-    else:
-
-        log.info(
-            "DELETE_REMOVED_EVENTS disabled."
+        context = create_browser_context(
+            browser
         )
 
-    # --------------------------------------------------------
-    # Statistics
-    # --------------------------------------------------------
+        page = context.new_page()
 
-    stats = SyncStats()
+        page.set_default_timeout(
+            PAGE_TIMEOUT
+        )
 
-    desired_ids = set()
+        try:
 
-    # --------------------------------------------------------
-    # Process rows
-    # --------------------------------------------------------
+            load_shiksha_page(
+                page
+            )
+
+            wait_for_page_content(
+                page
+            )
+
+            # ------------------------------------------------
+            # Try FullCalendar extraction
+            # ------------------------------------------------
+
+            events = extract_fullcalendar_events(
+                page
+            )
+
+            # ------------------------------------------------
+            # DOM fallback
+            # ------------------------------------------------
+
+            if not events:
+
+                logger.info(
+                    "FullCalendar extraction returned no events."
+                )
+
+                events = extract_dom_events(
+                    page
+                )
+
+            # ------------------------------------------------
+            # Text fallback
+            # ------------------------------------------------
+
+            if not events:
+
+                logger.info(
+                    "DOM extraction returned no events."
+                )
+
+                events = extract_calendar_text(
+                    page
+                )
+
+            # ------------------------------------------------
+            # Filter target month
+            # ------------------------------------------------
+
+            events = filter_target_month(
+                events,
+                TARGET_MONTH
+            )
+
+            # ------------------------------------------------
+            # Clean
+            # ------------------------------------------------
+
+            events = clean_events(
+                events
+            )
+
+            if not events:
+
+                logger.warning(
+                    "No rows found for %s.",
+                    TARGET_MONTH
+                )
+
+                logger.warning(
+                    "Possible reasons:"
+                )
+
+                logger.warning(
+                    "1. Shiksha has not published "
+                    "calendar data for this month."
+                )
+
+                logger.warning(
+                    "2. Website structure has changed."
+                )
+
+                logger.warning(
+                    "3. Calendar data is loaded "
+                    "dynamically through another API."
+                )
+
+                logger.warning(
+                    "4. The website blocked the request."
+                )
+
+                # Do not fail the GitHub workflow merely
+                # because no calendar events were found.
+                return []
+
+            return events
+
+        finally:
+
+            try:
+                context.close()
+            except Exception:
+                pass
+
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+
+# ============================================================
+# PRINT RESULTS
+# ============================================================
+
+def print_results(
+    rows: List[Dict[str, str]]
+) -> None:
+    """
+    Print scraped rows to the GitHub Actions log.
+    """
+
+    logger.info(
+        "=================================================="
+    )
+
+    logger.info(
+        "SCRAPED RESULTS"
+    )
+
+    logger.info(
+        "=================================================="
+    )
 
     for index, row in enumerate(
         rows,
-        start=1,
+        start=1
     ):
 
-        exam = str(
-            row.get(
-                "exam",
-                "",
-            )
-        ).strip()
-
-        date_str = str(
-            row.get(
-                "date",
-                "",
-            )
-        ).strip()
-
-        event_type = str(
-            row.get(
-                "Event",
-                row.get(
-                    "event",
-                    "",
-                ),
-            )
-        ).strip()
-
-        # ----------------------------------------------------
-        # Validate
-        # ----------------------------------------------------
-
-        if not exam:
-
-            stats.skipped += 1
-
-            log.warning(
-                "Skipping row %d: exam is empty.",
-                index,
-            )
-
-            continue
-
-        if not date_str:
-
-            stats.skipped += 1
-
-            log.warning(
-                "Skipping row %d: date is empty.",
-                index,
-            )
-
-            continue
-
-        parsed_date = parse_row_date(
-            date_str
+        logger.info(
+            "%d. %s | %s | %s",
+            index,
+            row.get("date", ""),
+            row.get("label", ""),
+            row.get("Event", ""),
         )
 
-        if parsed_date is None:
+    logger.info(
+        "=================================================="
+    )
 
-            stats.skipped += 1
 
-            log.warning(
-                "Skipping row %d: invalid date '%s'.",
-                index,
-                date_str,
-            )
+# ============================================================
+# MAIN
+# ============================================================
 
-            continue
+def main() -> int:
 
-        # Normalize date for event ID.
-        normalized_date = (
-            parsed_date.isoformat()
+    try:
+
+        # ----------------------------------------------------
+        # Configuration
+        # ----------------------------------------------------
+
+        validate_configuration()
+
+        logger.info(
+            "Configuration validated."
+        )
+
+        logger.info(
+            "Google Calendar is NOT used by scraper.py."
         )
 
         # ----------------------------------------------------
-        # Generate deterministic ID
+        # Scrape
         # ----------------------------------------------------
 
-        try:
+        rows = scrape_shiksha()
 
-            event_id = make_event_id(
-                exam,
-                normalized_date,
-                event_type,
+        # ----------------------------------------------------
+        # Handle no data
+        # ----------------------------------------------------
+
+        if not rows:
+
+            logger.warning(
+                "No data found for %s.",
+                TARGET_MONTH
             )
 
-        except Exception as error:
-
-            stats.failed += 1
-
-            log.error(
-                "Could not generate event ID for "
-                "'%s' (%s): %s",
-                exam,
-                date_str,
-                error,
+            logger.info(
+                "Scraper finished without Calendar processing."
             )
 
-            continue
+            return 0
 
-        desired_ids.add(
-            event_id
+        # ----------------------------------------------------
+        # Print
+        # ----------------------------------------------------
+
+        print_results(
+            rows
         )
 
         # ----------------------------------------------------
-        # Build event body
+        # Google Sheet
         # ----------------------------------------------------
 
-        try:
-
-            body = row_to_event_body(
-                row
-            )
-
-        except Exception as error:
-
-            stats.failed += 1
-
-            log.error(
-                "Failed to build event for "
-                "'%s' (%s): %s",
-                exam,
-                date_str,
-                error,
-            )
-
-            continue
-
-        # ----------------------------------------------------
-        # Create / Update
-        # ----------------------------------------------------
-
-        try:
-
-            action = upsert_event(
-                service,
-                calendar_id,
-                event_id,
-                body,
-            )
-
-            if action == "created":
-
-                stats.created += 1
-
-                log.info(
-                    "Created: %s (%s)",
-                    exam,
-                    normalized_date,
-                )
-
-            elif action == "updated":
-
-                stats.updated += 1
-
-                log.info(
-                    "Updated: %s (%s)",
-                    exam,
-                    normalized_date,
-                )
-
-        except HttpError as error:
-
-            stats.failed += 1
-
-            log.error(
-                "Failed to sync '%s' (%s): %s",
-                exam,
-                normalized_date,
-                error,
-            )
-
-        except Exception as error:
-
-            stats.failed += 1
-
-            log.error(
-                "Unexpected error syncing "
-                "'%s' (%s): %s",
-                exam,
-                normalized_date,
-                error,
-                exc_info=True,
-            )
-
-    # --------------------------------------------------------
-    # Delete removed events
-    # --------------------------------------------------------
-
-    if delete_removed:
-
-        log.info(
-            "Finding previously synced events..."
+        write_to_google_sheet(
+            rows
         )
 
-        try:
+        # ----------------------------------------------------
+        # SUCCESS
+        # ----------------------------------------------------
 
-            existing_ids = (
-                list_existing_synced_event_ids(
-                    service,
-                    calendar_id,
-                )
-            )
+        logger.info(
+            "=================================================="
+        )
 
-            stale_ids = (
-                existing_ids - desired_ids
-            )
+        logger.info(
+            "SCRAPER COMPLETED SUCCESSFULLY"
+        )
 
-            log.info(
-                "Found %d stale event(s).",
-                len(stale_ids),
-            )
+        logger.info(
+            "Rows processed: %d",
+            len(rows)
+        )
 
-            for event_id in stale_ids:
+        logger.info(
+            "Google Sheet updated."
+        )
 
-                try:
+        logger.info(
+            "Google Calendar was NOT accessed."
+        )
 
-                    delete_event(
-                        service,
-                        calendar_id,
-                        event_id,
-                    )
+        logger.info(
+            "=================================================="
+        )
 
-                    stats.deleted += 1
+        return 0
 
-                    log.info(
-                        "Deleted stale event: %s",
-                        event_id,
-                    )
+    except KeyboardInterrupt:
 
-                except HttpError as error:
+        logger.error(
+            "Process interrupted by user."
+        )
 
-                    stats.failed += 1
+        return 130
 
-                    log.error(
-                        "Failed to delete stale "
-                        "event %s: %s",
-                        event_id,
-                        error,
-                    )
+    except Exception as exc:
 
-        except HttpError as error:
+        logger.exception(
+            "Scraper failed: %s",
+            exc
+        )
 
-            stats.failed += 1
-
-            log.error(
-                "Could not list existing synced events: %s",
-                error,
-            )
-
-    # --------------------------------------------------------
-    # Final statistics
-    # --------------------------------------------------------
-
-    return stats
+        return 1
 
 
 # ============================================================
 # ENTRY POINT
 # ============================================================
 
-def main():
-
-    try:
-
-        stats = run_sync()
-
-    except RuntimeError as error:
-
-        log.error(
-            "Configuration error: %s",
-            error,
-        )
-
-        sys.exit(1)
-
-    except HttpError as error:
-
-        log.error(
-            "Google API error: %s",
-            error,
-            exc_info=True,
-        )
-
-        sys.exit(1)
-
-    except Exception as error:
-
-        log.error(
-            "Unexpected error during sync: %s",
-            error,
-            exc_info=True,
-        )
-
-        sys.exit(1)
-
-    log.info(
-        "Sync complete: %s",
-        stats.summary(),
-    )
-
-    if stats.failed > 0:
-
-        log.error(
-            "%d row(s)/event(s) failed.",
-            stats.failed,
-        )
-
-        # We deliberately return exit code 2 only if
-        # failures remain AFTER retrying.
-        sys.exit(2)
-
-    sys.exit(0)
-
-
-# ============================================================
-# START
-# ============================================================
-
 if __name__ == "__main__":
-    main()
+
+    sys.exit(
+        main()
+    )
