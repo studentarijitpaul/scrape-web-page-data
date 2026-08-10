@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+
   workflow_dispatch:
     inputs:
       delete_removed:
@@ -14,14 +15,19 @@ on:
         options:
           - "false"
           - "true"
+
   schedule:
-    - cron: "0 3 * * *"     # 03:00 UTC = 08:30 AM IST — scrape + sync run back-to-back daily
+    - cron: "0 3 * * *" # 03:00 UTC = 08:30 AM IST
+
 
 jobs:
+
   scrape:
     name: Run scraper
     runs-on: ubuntu-22.04
+
     steps:
+
       - name: Checkout Repository
         uses: actions/checkout@v4
 
@@ -38,22 +44,28 @@ jobs:
 
       - name: Install Playwright browser + OS dependencies
         working-directory: ET
-        run: playwright install --with-deps chromium
+        run: |
+          playwright install --with-deps chromium
 
       - name: Run scraper
         working-directory: ET
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-        run: python scraper.py
+        run: |
+          python scraper.py
+
 
   sync-calendar:
     name: Sync to Google Calendar
-    needs: scrape          # only runs if the scrape job succeeded
+    needs: scrape
     runs-on: ubuntu-22.04
+
     env:
       TZ: Asia/Kolkata
+
     steps:
+
       - name: Checkout Repository
         uses: actions/checkout@v4
 
@@ -68,15 +80,65 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Debug — check GOOGLE_CALENDAR_ID length
+      - name: Check Calendar ID
         env:
           GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
         run: |
-          echo "Byte length (expect 92 for a c_... calendar id):"
-          printf '%s' "$GOOGLE_CALENDAR_ID" | wc -c
-          echo "Hex dump of first and last 10 bytes (checks for stray quotes/newlines):"
-          printf '%s' "$GOOGLE_CALENDAR_ID" | head -c 10 | xxd
-          printf '%s' "$GOOGLE_CALENDAR_ID" | tail -c 10 | xxd
+          CALENDAR_ID="$(printf '%s' "$GOOGLE_CALENDAR_ID" | tr -d '\r\n')"
+
+          echo "Calendar ID present: $([ -n "$CALENDAR_ID" ] && echo true || echo false)"
+          echo "Calendar ID length: ${#CALENDAR_ID}"
+
+          case "$CALENDAR_ID" in
+            *@group.calendar.google.com)
+              echo "Calendar ID format: OK"
+              ;;
+            *)
+              echo "ERROR: Calendar ID does not end with @group.calendar.google.com"
+              exit 1
+              ;;
+          esac
+
+      - name: Test Google Calendar access
+        working-directory: ET
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+
+          from google.oauth2.service_account import Credentials
+          from googleapiclient.discovery import build
+
+          calendar_id = os.environ["GOOGLE_CALENDAR_ID"].strip()
+
+          credentials_info = json.loads(
+              os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+          )
+
+          credentials = Credentials.from_service_account_info(
+              credentials_info,
+              scopes=[
+                  "https://www.googleapis.com/auth/calendar"
+              ]
+          )
+
+          service = build(
+              "calendar",
+              "v3",
+              credentials=credentials
+          )
+
+          calendar = service.calendars().get(
+              calendarId=calendar_id
+          ).execute()
+
+          print("Google Calendar connection successful!")
+          print("Calendar name:", calendar.get("summary"))
+          print("Calendar timezone:", calendar.get("timeZone"))
+          PY
 
       - name: Run Calendar sync
         working-directory: ET
@@ -86,4 +148,5 @@ jobs:
           GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
           SYNC_TIMEZONE: Asia/Kolkata
           DELETE_REMOVED_EVENTS: ${{ github.event.inputs.delete_removed || 'false' }}
-        run: python calendar_sync.py
+        run: |
+          python calendar_sync.py
