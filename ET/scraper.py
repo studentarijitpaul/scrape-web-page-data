@@ -4,7 +4,6 @@ Uses Playwright + FullCalendar's own JS API to get the full event list,
 then filters to the requested month and writes the data to a Google Sheet.
 
 
-
 Usage:
     python scraper.py                    # August 2026 (default)
     python scraper.py "September 2026"   # any month/year
