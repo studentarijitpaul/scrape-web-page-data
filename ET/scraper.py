@@ -10,7 +10,7 @@ import random
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Optional, Callable, Any
+from typing import Optional
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -26,36 +26,27 @@ DEFAULT_TIMEZONE = "Asia/Kolkata"
 
 SYNC_SOURCE_TAG = "shiksha_exam_sync"
 
-# Google Calendar event IDs may contain only a-v and 0-9.
+# Google Calendar custom event IDs may contain:
+# a-v and 0-9
 EVENT_ID_PREFIX = "evt"
 
-# ------------------------------------------------------------
-# RATE LIMIT PROTECTION
-# ------------------------------------------------------------
-
-# Minimum delay between Calendar API requests.
-# Increase this if Google still returns rateLimitExceeded.
-MIN_API_DELAY = 1.5
-
-# Maximum number of retries for a single API request.
+# Number of retries for rate-limit/server errors
 MAX_RETRIES = 7
 
-# Initial exponential-backoff delay.
-INITIAL_BACKOFF = 2.0
+# Base retry delay.
+# Actual delay uses exponential backoff + jitter.
+BASE_RETRY_DELAY = 2
 
-# Maximum exponential-backoff delay.
-MAX_BACKOFF = 60.0
+# Maximum retry delay
+MAX_RETRY_DELAY = 60
 
-# Add random jitter so requests don't happen at exact intervals.
-JITTER_MIN = 0.5
-JITTER_MAX = 1.5
+# Small delay between successful API operations.
+# This helps prevent rate limiting.
+MIN_OPERATION_DELAY = 0.8
+MAX_OPERATION_DELAY = 1.8
 
-# Pause after a successful event operation.
-# This intentionally slows the sync down to avoid quota bursts.
-EVENT_DELAY = 1.0
-
-# Set this to True if you want removed events deleted.
-DELETE_REMOVED_EVENTS = False
+# Calendar name to prefer when automatically detecting
+TARGET_CALENDAR_NAME = "eng"
 
 
 # ============================================================
@@ -68,187 +59,6 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("calendar_sync")
-
-
-# ============================================================
-# GLOBAL API RATE LIMITER
-# ============================================================
-
-_last_api_request = 0.0
-
-
-def wait_before_api_request() -> None:
-    """
-    Ensure there is a minimum delay between Google Calendar API
-    requests.
-
-    This prevents the script from sending a burst of requests.
-    """
-
-    global _last_api_request
-
-    now = time.monotonic()
-
-    elapsed = now - _last_api_request
-
-    if elapsed < MIN_API_DELAY:
-        sleep_time = MIN_API_DELAY - elapsed
-        time.sleep(sleep_time)
-
-    _last_api_request = time.monotonic()
-
-
-# ============================================================
-# RETRY HELPERS
-# ============================================================
-
-RETRYABLE_STATUS_CODES = {
-    403,
-    429,
-    500,
-    502,
-    503,
-    504,
-}
-
-
-RETRYABLE_REASONS = {
-    "rateLimitExceeded",
-    "userRateLimitExceeded",
-    "backendError",
-    "internalError",
-}
-
-
-def get_http_error_reason(error: HttpError) -> str:
-    """
-    Extract Google's error reason from HttpError.
-    """
-
-    try:
-        content = error.content
-
-        if isinstance(content, bytes):
-            content = content.decode("utf-8", errors="ignore")
-
-        match = re.search(
-            r'"reason"\s*:\s*"([^"]+)"',
-            content,
-        )
-
-        if match:
-            return match.group(1)
-
-    except Exception:
-        pass
-
-    return ""
-
-
-def is_retryable_http_error(error: HttpError) -> bool:
-    """
-    Determine whether a Google API error should be retried.
-    """
-
-    status = getattr(error.resp, "status", None)
-
-    if status in RETRYABLE_STATUS_CODES:
-        return True
-
-    reason = get_http_error_reason(error)
-
-    if reason in RETRYABLE_REASONS:
-        return True
-
-    return False
-
-
-def execute_with_retry(
-    operation: Callable[[], Any],
-    operation_name: str,
-) -> Any:
-    """
-    Execute a Google Calendar API operation with:
-
-    - Minimum request spacing
-    - Exponential backoff
-    - Random jitter
-    - Retry handling for 403/429/5xx errors
-    """
-
-    for attempt in range(1, MAX_RETRIES + 1):
-
-        wait_before_api_request()
-
-        try:
-
-            result = operation()
-
-            return result
-
-        except HttpError as error:
-
-            status = getattr(error.resp, "status", None)
-
-            reason = get_http_error_reason(error)
-
-            if not is_retryable_http_error(error):
-
-                log.error(
-                    "%s failed permanently: HTTP %s reason=%s",
-                    operation_name,
-                    status,
-                    reason,
-                )
-
-                raise
-
-            if attempt >= MAX_RETRIES:
-
-                log.error(
-                    "%s failed after %d attempts: "
-                    "HTTP %s reason=%s",
-                    operation_name,
-                    attempt,
-                    status,
-                    reason,
-                )
-
-                raise
-
-            # ------------------------------------------------
-            # EXPONENTIAL BACKOFF
-            # ------------------------------------------------
-
-            backoff = min(
-                INITIAL_BACKOFF * (2 ** (attempt - 1)),
-                MAX_BACKOFF,
-            )
-
-            jitter = random.uniform(
-                JITTER_MIN,
-                JITTER_MAX,
-            )
-
-            sleep_time = backoff * jitter
-
-            log.warning(
-                "%s: Google API rate/backend limit "
-                "(HTTP %s, reason=%s). "
-                "Retry %d/%d in %.1f seconds...",
-                operation_name,
-                status,
-                reason or "unknown",
-                attempt,
-                MAX_RETRIES,
-                sleep_time,
-            )
-
-            time.sleep(sleep_time)
-
-    raise RuntimeError(
-        f"Retry loop exited unexpectedly: {operation_name}"
-    )
 
 
 # ============================================================
@@ -276,22 +86,169 @@ class SyncStats:
 
 
 # ============================================================
+# RATE LIMIT / RETRY HELPERS
+# ============================================================
+
+def is_retryable_http_error(error: HttpError) -> bool:
+    """
+    Determine whether a Google API error should be retried.
+
+    Retry:
+        403 rateLimitExceeded
+        403 userRateLimitExceeded
+        403 quotaExceeded
+        429 Too Many Requests
+        500
+        502
+        503
+        504
+
+    Do not retry ordinary errors such as:
+        400
+        401
+        404
+        409
+        etc.
+    """
+
+    try:
+        status = int(error.resp.status)
+    except Exception:
+        return False
+
+    if status in (429, 500, 502, 503, 504):
+        return True
+
+    if status != 403:
+        return False
+
+    try:
+        content = error.content.decode("utf-8", errors="ignore").lower()
+    except Exception:
+        content = str(error).lower()
+
+    retry_reasons = (
+        "ratelimitexceeded",
+        "userratelimitexceeded",
+        "quotaexceeded",
+        "backenderror",
+    )
+
+    return any(
+        reason in content
+        for reason in retry_reasons
+    )
+
+
+def retry_delay(attempt: int) -> float:
+    """
+    Exponential backoff with jitter.
+
+    attempt=1 -> roughly 2 sec
+    attempt=2 -> roughly 4 sec
+    attempt=3 -> roughly 8 sec
+    ...
+    """
+
+    delay = min(
+        BASE_RETRY_DELAY * (2 ** (attempt - 1)),
+        MAX_RETRY_DELAY,
+    )
+
+    # Add random jitter so repeated jobs do not
+    # all hit the API at exactly the same time.
+    jitter = random.uniform(0.5, 1.5)
+
+    return delay * jitter
+
+
+def execute_with_retry(
+    request_factory,
+    operation_name: str,
+):
+    """
+    Execute a Google API request with exponential backoff.
+
+    request_factory must be a function that returns
+    a fresh Google API request object.
+
+    Example:
+
+        execute_with_retry(
+            lambda: service.events().get(...),
+            "get event"
+        )
+    """
+
+    for attempt in range(1, MAX_RETRIES + 1):
+
+        try:
+
+            result = request_factory().execute()
+
+            # Small delay after every successful operation.
+            time.sleep(
+                random.uniform(
+                    MIN_OPERATION_DELAY,
+                    MAX_OPERATION_DELAY,
+                )
+            )
+
+            return result
+
+        except HttpError as error:
+
+            if not is_retryable_http_error(error):
+
+                raise
+
+            if attempt >= MAX_RETRIES:
+
+                log.error(
+                    "Google API operation failed after %d retries: %s",
+                    MAX_RETRIES,
+                    operation_name,
+                )
+
+                raise
+
+            delay = retry_delay(attempt)
+
+            log.warning(
+                "Google API rate/server limit during '%s'. "
+                "Retry %d/%d in %.1f seconds.",
+                operation_name,
+                attempt,
+                MAX_RETRIES,
+                delay,
+            )
+
+            time.sleep(delay)
+
+
+# ============================================================
 # EVENT ID
 # ============================================================
 
 def make_event_id(
     exam: str,
     date_str: str,
-    event_type: str = "",
+    event_type: str,
 ) -> str:
     """
     Generate a deterministic Google Calendar event ID.
 
-    The generated ID contains only:
+    The same:
+        exam + date + event type
+
+    will always generate the same event ID.
+
+    This allows the script to UPDATE an existing event
+    instead of creating duplicates.
+
+    Google Calendar custom IDs must contain only:
         a-v
         0-9
-
-    This ensures compatibility with Google Calendar.
     """
 
     key = (
@@ -306,45 +263,56 @@ def make_event_id(
 
     event_id = f"{EVENT_ID_PREFIX}{digest}"
 
-    # Google Calendar event IDs must contain only a-v and 0-9.
+    # Google Calendar allowed characters:
+    # a-v and 0-9
     if not re.fullmatch(
         r"[a-v0-9]{5,1024}",
         event_id,
     ):
         raise ValueError(
-            f"Generated invalid Google Calendar "
-            f"event ID: {event_id}"
+            f"Generated invalid Google Calendar event ID: "
+            f"{event_id}"
         )
 
     return event_id
 
 
 # ============================================================
-# DATE PARSING
+# DATE PARSER
 # ============================================================
 
 def parse_row_date(
     date_str: str,
 ) -> Optional[date]:
     """
-    Convert YYYY-MM-DD into a date object.
+    Convert supported date strings into date objects.
+
+    Primary format:
+        YYYY-MM-DD
+
+    Also supports common formats just in case.
     """
 
-    date_str = (date_str or "").strip()
+    date_str = (
+        date_str or ""
+    ).strip()
 
     if not date_str:
         return None
 
-    formats = [
+    formats = (
         "%Y-%m-%d",
         "%d-%m-%Y",
         "%d/%m/%Y",
         "%Y/%m/%d",
-    ]
+        "%d %B %Y",
+        "%d %b %Y",
+    )
 
     for fmt in formats:
 
         try:
+
             return datetime.strptime(
                 date_str,
                 fmt,
@@ -362,13 +330,202 @@ def parse_row_date(
 
 def build_calendar_service():
 
+    """
+    Build Google Calendar API service using the
+    credentials provided by google_sheets.py.
+    """
+
     creds = get_credentials()
 
-    return build(
+    if creds is None:
+
+        raise RuntimeError(
+            "Google credentials could not be loaded."
+        )
+
+    service = build(
         "calendar",
         "v3",
         credentials=creds,
         cache_discovery=False,
+    )
+
+    return service
+
+
+# ============================================================
+# AUTOMATIC CALENDAR DETECTION
+# ============================================================
+
+def get_calendar_id(
+    service,
+) -> str:
+    """
+    Get Google Calendar ID.
+
+    Priority:
+
+    1. GOOGLE_CALENDAR_ID environment variable
+    2. Calendar named 'eng'
+    3. First writable calendar
+
+    This is important because the previous working
+    version automatically detected the calendar.
+    """
+
+    # --------------------------------------------------------
+    # 1. Environment variable
+    # --------------------------------------------------------
+
+    calendar_id = os.getenv(
+        "GOOGLE_CALENDAR_ID",
+        "",
+    ).strip()
+
+    if calendar_id:
+
+        log.info(
+            "Using GOOGLE_CALENDAR_ID from environment."
+        )
+
+        log.info(
+            "Calendar ID detected: %s",
+            calendar_id,
+        )
+
+        return calendar_id
+
+    # --------------------------------------------------------
+    # 2. Automatically list calendars
+    # --------------------------------------------------------
+
+    log.info(
+        "GOOGLE_CALENDAR_ID not configured."
+    )
+
+    log.info(
+        "Attempting automatic calendar detection..."
+    )
+
+    calendars = []
+
+    page_token = None
+
+    while True:
+
+        response = execute_with_retry(
+            lambda: service.calendarList().list(
+                pageToken=page_token,
+                minAccessRole="writer",
+            ),
+            "list calendars",
+        )
+
+        calendars.extend(
+            response.get(
+                "items",
+                [],
+            )
+        )
+
+        page_token = response.get(
+            "nextPageToken"
+        )
+
+        if not page_token:
+            break
+
+    if not calendars:
+
+        raise RuntimeError(
+            "No writable Google Calendars were found. "
+            "Make sure the service account has access "
+            "to the calendar."
+        )
+
+    # --------------------------------------------------------
+    # Log calendars
+    # --------------------------------------------------------
+
+    log.info(
+        "Found %d writable calendar(s).",
+        len(calendars),
+    )
+
+    for calendar in calendars:
+
+        log.info(
+            "Available calendar: %s | ID: %s",
+            calendar.get(
+                "summary",
+                "Unnamed",
+            ),
+            calendar.get(
+                "id",
+                "",
+            ),
+        )
+
+    # --------------------------------------------------------
+    # 3. Prefer "eng"
+    # --------------------------------------------------------
+
+    for calendar in calendars:
+
+        name = (
+            calendar.get(
+                "summary",
+                "",
+            )
+            .strip()
+            .lower()
+        )
+
+        if name == TARGET_CALENDAR_NAME.lower():
+
+            calendar_id = calendar.get("id")
+
+            if calendar_id:
+
+                log.info(
+                    "Calendar ID detected: %s",
+                    calendar_id,
+                )
+
+                return calendar_id
+
+    # --------------------------------------------------------
+    # 4. Fallback to first writable calendar
+    # --------------------------------------------------------
+
+    for calendar in calendars:
+
+        calendar_id = calendar.get("id")
+
+        if calendar_id:
+
+            log.warning(
+                "Calendar '%s' was not found.",
+                TARGET_CALENDAR_NAME,
+            )
+
+            log.info(
+                "Using first writable calendar: %s",
+                calendar.get(
+                    "summary",
+                    "Unnamed",
+                ),
+            )
+
+            log.info(
+                "Calendar ID detected: %s",
+                calendar_id,
+            )
+
+            return calendar_id
+
+    raise RuntimeError(
+        "Could not determine a valid Google Calendar ID."
     )
 
 
@@ -381,17 +538,28 @@ def test_calendar_access(
     calendar_id: str,
 ):
     """
-    Verify Calendar access before syncing.
+    Test whether the service account can access
+    the specified Google Calendar.
     """
 
-    log.info("Testing Google Calendar access...")
-
-    result = execute_with_retry(
-        lambda: service.calendars().get(
-            calendarId=calendar_id
-        ).execute(),
-        "Calendar access test",
+    log.info(
+        "Testing Google Calendar access..."
     )
+
+    try:
+
+        calendar = execute_with_retry(
+            lambda: service.calendars().get(
+                calendarId=calendar_id,
+            ),
+            "test calendar access",
+        )
+
+    except HttpError as error:
+
+        raise RuntimeError(
+            f"Unable to access Google Calendar: {error}"
+        )
 
     log.info(
         "Google Calendar connection successful!"
@@ -399,73 +567,157 @@ def test_calendar_access(
 
     log.info(
         "Calendar name: %s",
-        result.get("summary"),
+        calendar.get(
+            "summary",
+            "Unknown",
+        ),
     )
 
     log.info(
         "Calendar timezone: %s",
-        result.get("timeZone"),
+        calendar.get(
+            "timeZone",
+            DEFAULT_TIMEZONE,
+        ),
     )
 
-    return result
-
 
 # ============================================================
-# EVENT BODY
+# ROW -> GOOGLE CALENDAR EVENT
 # ============================================================
 
-def row_to_event_body(row: dict) -> dict:
+def row_to_event_body(
+    row: dict,
+) -> dict:
     """
     Convert a Google Sheet row into a Google Calendar
     all-day event.
     """
 
+    date_str = str(
+        row.get(
+            "date",
+            "",
+        )
+    ).strip()
+
     d = parse_row_date(
-        row.get("date", "")
+        date_str
     )
 
     if d is None:
 
         raise ValueError(
-            f"Invalid date: {row.get('date')}"
+            f"Invalid date: {date_str}"
         )
 
-    end = d + timedelta(days=1)
+    # Google Calendar all-day event end date
+    # is EXCLUSIVE.
+    end = d + timedelta(
+        days=1
+    )
 
     exam = str(
-        row.get("exam", "")
+        row.get(
+            "exam",
+            "",
+        )
+    ).strip()
+
+    event_type = str(
+        row.get(
+            "Event",
+            row.get(
+                "event",
+                "",
+            ),
+        )
     ).strip()
 
     label = str(
-        row.get("label", "")
-    ).strip()
-
-    event = str(
-        row.get("Event", "")
+        row.get(
+            "label",
+            "",
+        )
     ).strip()
 
     description_lines = []
+
+    if exam:
+        description_lines.append(
+            f"Exam: {exam}"
+        )
 
     if label:
         description_lines.append(
             f"Label: {label}"
         )
 
-    if event:
+    if event_type:
         description_lines.append(
-            f"Event: {event}"
+            f"Event: {event_type}"
+        )
+
+    # Add remaining columns to description.
+    used_fields = {
+        "date",
+        "exam",
+        "label",
+        "Event",
+        "event",
+    }
+
+    for key, value in row.items():
+
+        if key in used_fields:
+            continue
+
+        if value is None:
+            continue
+
+        value = str(value).strip()
+
+        if not value:
+            continue
+
+        description_lines.append(
+            f"{key}: {value}"
         )
 
     description_lines.append(
         f"Source: {SYNC_SOURCE_TAG}"
     )
 
-    body = {
-        "summary": exam or "Exam Event",
+    description = "\n".join(
+        description_lines
+    )
 
-        "description": "\n".join(
-            description_lines
-        ),
+    summary_parts = []
+
+    if exam:
+        summary_parts.append(exam)
+
+    if event_type:
+        summary_parts.append(
+            event_type
+        )
+
+    if label:
+        summary_parts.append(
+            label
+        )
+
+    summary = " - ".join(
+        summary_parts
+    )
+
+    if not summary:
+        summary = "Exam Calendar Event"
+
+    body = {
+        "summary": summary,
+
+        "description": description,
 
         "start": {
             "date": d.isoformat(),
@@ -478,8 +730,6 @@ def row_to_event_body(row: dict) -> dict:
         "extendedProperties": {
             "private": {
                 "sync_source": SYNC_SOURCE_TAG,
-                "exam": exam,
-                "date": d.isoformat(),
             }
         },
     }
@@ -488,7 +738,7 @@ def row_to_event_body(row: dict) -> dict:
 
 
 # ============================================================
-# UPSERT EVENT
+# CREATE / UPDATE EVENT
 # ============================================================
 
 def upsert_event(
@@ -498,84 +748,103 @@ def upsert_event(
     body: dict,
 ) -> str:
     """
-    Create or update an event.
+    Create an event.
 
-    Uses deterministic event IDs so that repeated runs
-    update existing events instead of creating duplicates.
+    If the event already exists, update it.
+
+    Returns:
+        "created"
+        "updated"
     """
 
     # --------------------------------------------------------
-    # TRY UPDATE FIRST
+    # First try to UPDATE the deterministic event ID.
     # --------------------------------------------------------
-
-    def update_operation():
-
-        return service.events().update(
-            calendarId=calendar_id,
-            eventId=event_id,
-            body=body,
-            sendUpdates="none",
-        ).execute()
 
     try:
 
         execute_with_retry(
-            update_operation,
-            f"Update event {event_id}",
+            lambda: service.events().update(
+                calendarId=calendar_id,
+                eventId=event_id,
+                body=body,
+            ),
+            "update event",
         )
 
         return "updated"
 
     except HttpError as error:
 
-        status = getattr(
-            error.resp,
-            "status",
-            None,
-        )
+        # 404 means the event does not exist.
+        try:
+            status = int(
+                error.resp.status
+            )
+        except Exception:
+            status = 0
 
-        # Event does not exist.
         if status != 404:
+
+            # 409 can happen if another operation created
+            # the same deterministic ID.
+            if status == 409:
+
+                try:
+
+                    execute_with_retry(
+                        lambda: service.events().update(
+                            calendarId=calendar_id,
+                            eventId=event_id,
+                            body=body,
+                        ),
+                        "resolve conflicting event",
+                    )
+
+                    return "updated"
+
+                except HttpError:
+                    raise
 
             raise
 
     # --------------------------------------------------------
-    # EVENT DOES NOT EXIST
-    # CREATE IT
+    # Event does not exist -> INSERT
     # --------------------------------------------------------
-
-    def insert_operation():
-
-        return service.events().insert(
-            calendarId=calendar_id,
-            body=body,
-            sendUpdates="none",
-        ).execute()
 
     try:
 
         execute_with_retry(
-            insert_operation,
-            f"Create event {event_id}",
+            lambda: service.events().insert(
+                calendarId=calendar_id,
+                body=body,
+                sendUpdates="none",
+            ),
+            "create event",
         )
 
         return "created"
 
     except HttpError as error:
 
-        status = getattr(
-            error.resp,
-            "status",
-            None,
-        )
+        # If another process created it between GET/INSERT,
+        # try update once.
+        try:
+            status = int(
+                error.resp.status
+            )
+        except Exception:
+            status = 0
 
-        # Another process may have created it between
-        # our update and insert.
         if status == 409:
 
             execute_with_retry(
-                update_operation,
-                f"Update after conflict {event_id}",
+                lambda: service.events().update(
+                    calendarId=calendar_id,
+                    eventId=event_id,
+                    body=body,
+                ),
+                "update after conflict",
             )
 
             return "updated"
@@ -594,35 +863,31 @@ def delete_event(
 ):
     """
     Delete a Google Calendar event.
+
+    404 means the event is already gone,
+    so it is ignored.
     """
-
-    def delete_operation():
-
-        return service.events().delete(
-            calendarId=calendar_id,
-            eventId=event_id,
-        ).execute()
 
     try:
 
         execute_with_retry(
-            delete_operation,
-            f"Delete event {event_id}",
+            lambda: service.events().delete(
+                calendarId=calendar_id,
+                eventId=event_id,
+            ),
+            "delete event",
         )
 
     except HttpError as error:
 
-        status = getattr(
-            error.resp,
-            "status",
-            None,
-        )
+        try:
+            status = int(
+                error.resp.status
+            )
+        except Exception:
+            status = 0
 
         # Already deleted.
-        if status == 410:
-            return
-
-        # Not found.
         if status == 404:
             return
 
@@ -630,7 +895,7 @@ def delete_event(
 
 
 # ============================================================
-# LIST EXISTING SYNC EVENTS
+# FIND EXISTING SYNC EVENTS
 # ============================================================
 
 def list_existing_synced_event_ids(
@@ -638,9 +903,11 @@ def list_existing_synced_event_ids(
     calendar_id: str,
 ) -> set[str]:
     """
-    Find events previously created by this sync script.
+    Find all events previously created by this
+    synchronization script.
 
-    Pagination is handled automatically.
+    Uses extendedProperties instead of searching the
+    description manually.
     """
 
     ids = set()
@@ -649,43 +916,29 @@ def list_existing_synced_event_ids(
 
     while True:
 
-        def list_operation():
-
-            request = service.events().list(
-                calendarId=calendar_id,
-                maxResults=250,
-                singleEvents=False,
-                showDeleted=False,
-                pageToken=page_token,
-            )
-
-            return request.execute()
-
         response = execute_with_retry(
-            list_operation,
-            "List Calendar events",
+            lambda: service.events().list(
+                calendarId=calendar_id,
+                privateExtendedProperty=(
+                    f"sync_source={SYNC_SOURCE_TAG}"
+                ),
+                showDeleted=False,
+                singleEvents=True,
+                maxResults=2500,
+                pageToken=page_token,
+            ),
+            "list synced events",
         )
 
-        for item in response.get(
+        for event in response.get(
             "items",
             [],
         ):
 
-            private_props = (
-                item
-                .get("extendedProperties", {})
-                .get("private", {})
-            )
+            event_id = event.get("id")
 
-            if (
-                private_props.get("sync_source")
-                == SYNC_SOURCE_TAG
-            ):
-
-                event_id = item.get("id")
-
-                if event_id:
-                    ids.add(event_id)
+            if event_id:
+                ids.add(event_id)
 
         page_token = response.get(
             "nextPageToken"
@@ -698,127 +951,13 @@ def list_existing_synced_event_ids(
 
 
 # ============================================================
-# ROW NORMALIZATION
-# ============================================================
-
-def normalize_row(row: dict) -> Optional[dict]:
-    """
-    Clean a spreadsheet row.
-    """
-
-    if not row:
-        return None
-
-    cleaned = {}
-
-    for key, value in row.items():
-
-        if key is None:
-            continue
-
-        clean_key = str(key).strip()
-
-        clean_value = (
-            str(value).strip()
-            if value is not None
-            else ""
-        )
-
-        cleaned[clean_key] = clean_value
-
-    exam = cleaned.get("exam", "")
-    date_str = cleaned.get("date", "")
-
-    if not exam or not date_str:
-        return None
-
-    return cleaned
-
-
-# ============================================================
-# DEDUPLICATION
-# ============================================================
-
-def deduplicate_rows(
-    rows: list[dict],
-) -> list[dict]:
-    """
-    Remove duplicate exam/date/event combinations.
-
-    This is important because duplicate spreadsheet rows
-    otherwise cause unnecessary Calendar API requests.
-    """
-
-    unique = {}
-
-    duplicates = 0
-
-    for row in rows:
-
-        normalized = normalize_row(row)
-
-        if normalized is None:
-            continue
-
-        key = (
-            normalized.get("exam", "")
-            .strip()
-            .lower(),
-
-            normalized.get("date", "")
-            .strip(),
-
-            normalized.get("Event", "")
-            .strip()
-            .lower(),
-        )
-
-        if key in unique:
-
-            duplicates += 1
-
-            continue
-
-        unique[key] = normalized
-
-    log.info(
-        "Removed %d duplicate row(s).",
-        duplicates,
-    )
-
-    return list(unique.values())
-
-
-# ============================================================
 # MAIN SYNC
 # ============================================================
 
 def run_sync():
 
-    stats = SyncStats()
-
     # --------------------------------------------------------
-    # CALENDAR ID
-    # --------------------------------------------------------
-
-    calendar_id = os.getenv(
-        "GOOGLE_CALENDAR_ID"
-    )
-
-    if not calendar_id:
-
-        raise RuntimeError(
-            "GOOGLE_CALENDAR_ID environment variable "
-            "is not configured."
-        )
-
-    log.info(
-        "Calendar ID detected: %s",
-        calendar_id,
-    )
-
-    # --------------------------------------------------------
-    # READ GOOGLE SHEET
+    # Read Google Sheet
     # --------------------------------------------------------
 
     log.info(
@@ -832,33 +971,30 @@ def run_sync():
         len(rows),
     )
 
-    # --------------------------------------------------------
-    # DEDUPLICATE
-    # --------------------------------------------------------
-
-    rows = deduplicate_rows(rows)
-
-    log.info(
-        "Processing %d unique row(s).",
-        len(rows),
-    )
-
     if not rows:
 
         log.warning(
-            "No valid rows found."
+            "No rows found in Google Sheet."
         )
 
-        return stats
+        return SyncStats()
 
     # --------------------------------------------------------
-    # BUILD CALENDAR SERVICE
+    # Build Calendar service
     # --------------------------------------------------------
 
     service = build_calendar_service()
 
     # --------------------------------------------------------
-    # TEST CALENDAR
+    # Detect Calendar automatically
+    # --------------------------------------------------------
+
+    calendar_id = get_calendar_id(
+        service
+    )
+
+    # --------------------------------------------------------
+    # Test Calendar
     # --------------------------------------------------------
 
     test_calendar_access(
@@ -867,13 +1003,46 @@ def run_sync():
     )
 
     # --------------------------------------------------------
-    # TRACK DESIRED EVENTS
+    # Configuration
     # --------------------------------------------------------
+
+    delete_removed = (
+        os.getenv(
+            "DELETE_REMOVED_EVENTS",
+            "false",
+        )
+        .strip()
+        .lower()
+        in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    )
+
+    if delete_removed:
+
+        log.info(
+            "DELETE_REMOVED_EVENTS enabled."
+        )
+
+    else:
+
+        log.info(
+            "DELETE_REMOVED_EVENTS disabled."
+        )
+
+    # --------------------------------------------------------
+    # Statistics
+    # --------------------------------------------------------
+
+    stats = SyncStats()
 
     desired_ids = set()
 
     # --------------------------------------------------------
-    # PROCESS ROWS
+    # Process rows
     # --------------------------------------------------------
 
     for index, row in enumerate(
@@ -881,32 +1050,55 @@ def run_sync():
         start=1,
     ):
 
-        exam = row.get(
-            "exam",
-            "",
+        exam = str(
+            row.get(
+                "exam",
+                "",
+            )
         ).strip()
 
-        date_str = row.get(
-            "date",
-            "",
+        date_str = str(
+            row.get(
+                "date",
+                "",
+            )
         ).strip()
 
-        event_type = row.get(
-            "Event",
-            "",
+        event_type = str(
+            row.get(
+                "Event",
+                row.get(
+                    "event",
+                    "",
+                ),
+            )
         ).strip()
-
-        log.info(
-            "Processing %d/%d: %s (%s)",
-            index,
-            len(rows),
-            exam,
-            date_str,
-        )
 
         # ----------------------------------------------------
-        # VALIDATE DATE
+        # Validate
         # ----------------------------------------------------
+
+        if not exam:
+
+            stats.skipped += 1
+
+            log.warning(
+                "Skipping row %d: exam is empty.",
+                index,
+            )
+
+            continue
+
+        if not date_str:
+
+            stats.skipped += 1
+
+            log.warning(
+                "Skipping row %d: date is empty.",
+                index,
+            )
+
+            continue
 
         parsed_date = parse_row_date(
             date_str
@@ -917,46 +1109,74 @@ def run_sync():
             stats.skipped += 1
 
             log.warning(
-                "Skipping invalid date: %s (%s)",
-                exam,
+                "Skipping row %d: invalid date '%s'.",
+                index,
                 date_str,
             )
 
             continue
 
-        # ----------------------------------------------------
-        # EVENT ID
-        # ----------------------------------------------------
-
-        event_id = make_event_id(
-            exam,
-            date_str,
-            event_type,
+        # Normalize date for event ID.
+        normalized_date = (
+            parsed_date.isoformat()
         )
 
-        desired_ids.add(event_id)
-
         # ----------------------------------------------------
-        # EVENT BODY
+        # Generate deterministic ID
         # ----------------------------------------------------
 
         try:
 
-            body = row_to_event_body(row)
+            event_id = make_event_id(
+                exam,
+                normalized_date,
+                event_type,
+            )
 
-        except ValueError as error:
+        except Exception as error:
 
-            stats.skipped += 1
+            stats.failed += 1
 
-            log.warning(
-                "Skipping row: %s",
+            log.error(
+                "Could not generate event ID for "
+                "'%s' (%s): %s",
+                exam,
+                date_str,
+                error,
+            )
+
+            continue
+
+        desired_ids.add(
+            event_id
+        )
+
+        # ----------------------------------------------------
+        # Build event body
+        # ----------------------------------------------------
+
+        try:
+
+            body = row_to_event_body(
+                row
+            )
+
+        except Exception as error:
+
+            stats.failed += 1
+
+            log.error(
+                "Failed to build event for "
+                "'%s' (%s): %s",
+                exam,
+                date_str,
                 error,
             )
 
             continue
 
         # ----------------------------------------------------
-        # CREATE / UPDATE
+        # Create / Update
         # ----------------------------------------------------
 
         try:
@@ -975,7 +1195,7 @@ def run_sync():
                 log.info(
                     "Created: %s (%s)",
                     exam,
-                    date_str,
+                    normalized_date,
                 )
 
             elif action == "updated":
@@ -985,20 +1205,8 @@ def run_sync():
                 log.info(
                     "Updated: %s (%s)",
                     exam,
-                    date_str,
+                    normalized_date,
                 )
-
-            # ------------------------------------------------
-            # EXTRA SPACING BETWEEN EVENTS
-            # ------------------------------------------------
-
-            time.sleep(
-                EVENT_DELAY
-                * random.uniform(
-                    0.8,
-                    1.2,
-                )
-            )
 
         except HttpError as error:
 
@@ -1007,7 +1215,7 @@ def run_sync():
             log.error(
                 "Failed to sync '%s' (%s): %s",
                 exam,
-                date_str,
+                normalized_date,
                 error,
             )
 
@@ -1016,21 +1224,22 @@ def run_sync():
             stats.failed += 1
 
             log.error(
-                "Unexpected failure for '%s' (%s): %s",
+                "Unexpected error syncing "
+                "'%s' (%s): %s",
                 exam,
-                date_str,
+                normalized_date,
                 error,
                 exc_info=True,
             )
 
     # --------------------------------------------------------
-    # DELETE REMOVED EVENTS
+    # Delete removed events
     # --------------------------------------------------------
 
-    if DELETE_REMOVED_EVENTS:
+    if delete_removed:
 
         log.info(
-            "DELETE_REMOVED_EVENTS enabled."
+            "Finding previously synced events..."
         )
 
         try:
@@ -1068,10 +1277,6 @@ def run_sync():
                         event_id,
                     )
 
-                    time.sleep(
-                        EVENT_DELAY
-                    )
-
                 except HttpError as error:
 
                     stats.failed += 1
@@ -1088,16 +1293,13 @@ def run_sync():
             stats.failed += 1
 
             log.error(
-                "Failed while scanning existing "
-                "Calendar events: %s",
+                "Could not list existing synced events: %s",
                 error,
             )
 
-    else:
-
-        log.info(
-            "DELETE_REMOVED_EVENTS disabled."
-        )
+    # --------------------------------------------------------
+    # Final statistics
+    # --------------------------------------------------------
 
     return stats
 
@@ -1121,6 +1323,16 @@ def main():
 
         sys.exit(1)
 
+    except HttpError as error:
+
+        log.error(
+            "Google API error: %s",
+            error,
+            exc_info=True,
+        )
+
+        sys.exit(1)
+
     except Exception as error:
 
         log.error(
@@ -1138,26 +1350,21 @@ def main():
 
     if stats.failed > 0:
 
-        log.warning(
+        log.error(
             "%d row(s)/event(s) failed.",
             stats.failed,
         )
 
-        # IMPORTANT:
-        # We do NOT immediately fail GitHub Actions.
-        #
-        # Some rows may have failed because Google temporarily
-        # throttled the API. The successful rows are still valid.
-        #
-        # If you want GitHub Actions to fail when ANY row fails,
-        # change this back to:
-        #
-        # sys.exit(2)
-
-        sys.exit(0)
+        # We deliberately return exit code 2 only if
+        # failures remain AFTER retrying.
+        sys.exit(2)
 
     sys.exit(0)
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main()
