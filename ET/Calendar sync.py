@@ -174,7 +174,7 @@ def delete_event(service, calendar_id: str, event_id: str) -> None:
 def run_sync() -> SyncStats:
     stats = SyncStats()
 
-    calendar_id = os.environ.get("GOOGLE_CALENDAR_ID")
+    calendar_id = (os.environ.get("GOOGLE_CALENDAR_ID") or "").strip()
     if not calendar_id:
         raise RuntimeError("GOOGLE_CALENDAR_ID environment variable is not set.")
 
