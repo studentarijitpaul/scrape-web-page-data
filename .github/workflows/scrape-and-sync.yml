@@ -68,6 +68,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Debug — check GOOGLE_CALENDAR_ID length
+        env:
+          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+        run: |
+          echo "Byte length (expect 92 for a c_... calendar id):"
+          printf '%s' "$GOOGLE_CALENDAR_ID" | wc -c
+          echo "Hex dump of first and last 10 bytes (checks for stray quotes/newlines):"
+          printf '%s' "$GOOGLE_CALENDAR_ID" | head -c 10 | xxd
+          printf '%s' "$GOOGLE_CALENDAR_ID" | tail -c 10 | xxd
+
       - name: Run Calendar sync
         working-directory: ET
         env:
