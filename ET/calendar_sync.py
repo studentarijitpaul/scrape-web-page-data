@@ -15,10 +15,26 @@ from googleapiclient.errors import HttpError
 from google_sheets import get_credentials, read_all_rows
 
 
-DEFAULT_TIMEZONE = "Asia/Kolkata"
-SYNC_SOURCE_TAG = "shiksha_exam_sync"
-EVENT_ID_PREFIX = "exam"
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
+DEFAULT_TIMEZONE = "Asia/Kolkata"
+
+SYNC_SOURCE_TAG = "shiksha_exam_sync"
+
+# IMPORTANT:
+# Google Calendar custom event IDs must use only:
+# a-v and 0-9
+#
+# "exam" was invalid because it contains "x".
+#
+EVENT_ID_PREFIX = "evt"
+
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +44,10 @@ logging.basicConfig(
 
 log = logging.getLogger("calendar_sync")
 
+
+# ============================================================
+# SYNC STATISTICS
+# ============================================================
 
 @dataclass
 class SyncStats:
@@ -100,6 +120,12 @@ def make_event_id(
     date_str: str,
     event_type: str
 ) -> str:
+    """
+    Generate a deterministic Google Calendar event ID.
+
+    The generated ID contains only characters allowed by
+    Google Calendar custom event IDs.
+    """
 
     key = (
         f"{exam.strip().lower()}|"
@@ -111,7 +137,20 @@ def make_event_id(
         key.encode("utf-8")
     ).hexdigest()
 
-    return f"{EVENT_ID_PREFIX}{digest}"
+    event_id = f"{EVENT_ID_PREFIX}{digest}"
+
+    # Google Calendar event IDs must contain only:
+    # a-v and 0-9
+    if not re.fullmatch(
+        r"[a-v0-9]{5,1024}",
+        event_id
+    ):
+        raise ValueError(
+            f"Generated invalid Google Calendar event ID: "
+            f"{event_id}"
+        )
+
+    return event_id
 
 
 # ============================================================
@@ -121,6 +160,9 @@ def make_event_id(
 def parse_row_date(
     date_str: str
 ) -> Optional[date]:
+    """
+    Convert YYYY-MM-DD string into a date object.
+    """
 
     date_str = (date_str or "").strip()
 
@@ -142,6 +184,10 @@ def parse_row_date(
 # ============================================================
 
 def build_calendar_service():
+    """
+    Build Google Calendar API service using the
+    credentials provided by google_sheets.py.
+    """
 
     creds = get_credentials()
 
@@ -161,8 +207,14 @@ def test_calendar_access(
     service,
     calendar_id: str
 ):
+    """
+    Test whether the service account can access
+    the specified Google Calendar.
+    """
 
-    log.info("Testing Google Calendar access...")
+    log.info(
+        "Testing Google Calendar access..."
+    )
 
     try:
 
@@ -224,6 +276,9 @@ def test_calendar_access(
 # ============================================================
 
 def row_to_event_body(row: dict) -> dict:
+    """
+    Convert a Google Sheet row into a Google Calendar event.
+    """
 
     d = parse_row_date(
         row.get("date", "")
@@ -234,6 +289,8 @@ def row_to_event_body(row: dict) -> dict:
             f"Invalid date: {row.get('date')}"
         )
 
+    # Google Calendar uses an exclusive end date
+    # for all-day events.
     end = d + timedelta(days=1)
 
     description_lines = []
@@ -313,6 +370,11 @@ def upsert_event(
     event_id: str,
     body: dict
 ) -> str:
+    """
+    Create an event.
+
+    If the event already exists, update it instead.
+    """
 
     body = dict(body)
 
@@ -329,6 +391,7 @@ def upsert_event(
 
     except HttpError as e:
 
+        # Event already exists
         if e.resp.status == 409:
 
             service.events().update(
@@ -343,7 +406,7 @@ def upsert_event(
 
 
 # ============================================================
-# DELETE
+# DELETE EVENT
 # ============================================================
 
 def delete_event(
@@ -351,6 +414,11 @@ def delete_event(
     calendar_id: str,
     event_id: str
 ):
+    """
+    Delete a Google Calendar event.
+
+    410 means the event is already gone, so it is ignored.
+    """
 
     try:
 
@@ -373,6 +441,9 @@ def list_existing_synced_event_ids(
     service,
     calendar_id: str
 ) -> set[str]:
+    """
+    Find all events previously created by this sync script.
+    """
 
     ids = set()
 
@@ -478,7 +549,6 @@ def run_sync() -> SyncStats:
     service = build_calendar_service()
 
     # --------------------------------------------------------
-    # IMPORTANT:
     # Test Calendar BEFORE processing rows
     # --------------------------------------------------------
 
@@ -521,6 +591,10 @@ def run_sync() -> SyncStats:
 
             continue
 
+        # ----------------------------------------------------
+        # Generate deterministic event ID
+        # ----------------------------------------------------
+
         event_id = make_event_id(
             row["exam"],
             row["date"],
@@ -529,7 +603,15 @@ def run_sync() -> SyncStats:
 
         desired_ids.add(event_id)
 
+        # ----------------------------------------------------
+        # Build event body
+        # ----------------------------------------------------
+
         body = row_to_event_body(row)
+
+        # ----------------------------------------------------
+        # Create / update event
+        # ----------------------------------------------------
 
         try:
 
