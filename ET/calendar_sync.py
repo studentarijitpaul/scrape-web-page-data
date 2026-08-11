@@ -49,6 +49,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from google_sheets import get_credentials, read_all_rows
+import google_chat
 
 
 # ============================================================
@@ -1151,6 +1152,11 @@ def main() -> None:
             error,
         )
 
+        google_chat.send_failure_message(
+            component="Configuration",
+            error=str(error),
+        )
+
         sys.exit(1)
 
     except Exception as error:
@@ -1159,6 +1165,11 @@ def main() -> None:
             "Unexpected error during sync: %s",
             error,
             exc_info=True,
+        )
+
+        google_chat.send_failure_message(
+            component="Google Calendar",
+            error=str(error),
         )
 
         sys.exit(1)
@@ -1175,11 +1186,51 @@ def main() -> None:
             stats.failed,
         )
 
+        # Some rows succeeded and some failed - report it as a
+        # failure so it isn't missed, without pretending the whole
+        # run was clean.
+        google_chat.send_failure_message(
+            component="Google Calendar",
+            error=(
+                f"{stats.failed} row(s)/event(s) failed to sync. "
+                f"Full stats: {stats.summary()}"
+            ),
+        )
+
         sys.exit(2)
+
+    # ----------------------------------------------------------
+    # This is the final stage of the pipeline (Sheets -> Calendar
+    # -> Chat), so it is the right place to send the combined
+    # success notification.
+    # ----------------------------------------------------------
+
+    if stats.created == 0 and stats.updated == 0 and stats.deleted == 0:
+
+        log.info(
+            "[GOOGLE CHAT] No changes detected - sending "
+            "no-changes notification."
+        )
+
+        google_chat.send_no_changes_message(
+            skipped_events=stats.skipped,
+        )
+
+    else:
+
+        log.info(
+            "[GOOGLE CHAT] Sending success notification..."
+        )
+
+        google_chat.send_success_message(
+            new_events=stats.created,
+            updated_events=stats.updated,
+            skipped_events=stats.skipped,
+            removed_events=stats.deleted,
+        )
 
     sys.exit(0)
 
 
 if __name__ == "__main__":
     main()
-    
