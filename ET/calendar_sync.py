@@ -26,6 +26,8 @@ Optional:
     SYNC_TIMEZONE
     DELETE_REMOVED_EVENTS
 
+    
+
 Exit codes:
     0 = success
     1 = configuration/authentication error
