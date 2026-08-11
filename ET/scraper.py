@@ -43,6 +43,8 @@ from playwright.sync_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+import google_chat
+
 
 # ============================================================
 # CONFIGURATION
@@ -1130,6 +1132,11 @@ def print_results(
 
 def main() -> int:
 
+    # Tracks which stage is currently running so that, if an
+    # exception is raised, the Google Chat failure notification
+    # can report an accurate "Component:" name.
+    current_component = "Configuration"
+
     try:
 
         # ----------------------------------------------------
@@ -1149,6 +1156,8 @@ def main() -> int:
         # ----------------------------------------------------
         # Scrape
         # ----------------------------------------------------
+
+        current_component = "Scraper"
 
         rows = scrape_shiksha()
 
@@ -1180,6 +1189,8 @@ def main() -> int:
         # ----------------------------------------------------
         # Google Sheet
         # ----------------------------------------------------
+
+        current_component = "Google Sheets"
 
         write_to_google_sheet(
             rows
@@ -1229,6 +1240,11 @@ def main() -> int:
         logger.exception(
             "Scraper failed: %s",
             exc
+        )
+
+        google_chat.send_failure_message(
+            component=current_component,
+            error=str(exc),
         )
 
         return 1
