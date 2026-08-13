@@ -1,5 +1,0 @@
-playwright==1.44.0
-playwright
-google-auth
-gspread
-google-api-python-client==2.140.0
