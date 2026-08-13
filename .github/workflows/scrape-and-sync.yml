@@ -295,3 +295,18 @@ jobs:
           echo "=========================================="
           echo "Sync completed"
           echo "=========================================="
+
+      # --------------------------------------------------------
+      # If the scraper found zero events on every retry, it saves a
+      # screenshot + HTML dump of what it actually saw. Upload those
+      # so a failure can be diagnosed from the Actions run itself
+      # (e.g. a Cloudflare challenge page) instead of guessing.
+      # --------------------------------------------------------
+      - name: Upload Scraper Debug Snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-debug-snapshot
+          path: ET/debug_artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
