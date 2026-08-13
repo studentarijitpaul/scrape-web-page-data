@@ -1,0 +1,5 @@
+playwright==1.44.0
+google-auth
+gspread
+google-api-python-client==2.140.0
+pytest
