@@ -445,9 +445,30 @@ def load_shiksha_page(page) -> None:
         raise
 
 
+# Selectors that indicate the FullCalendar widget has actually mounted.
+# Shared by the explicit wait below and by find_calendar_container(), so
+# the two stay in sync if Shiksha changes its markup again.
+CALENDAR_SELECTORS = [
+    ".fc",
+    ".fc-view-harness",
+    ".fc-view",
+    "[class*='calendar']",
+    "[id*='calendar']",
+]
+
+
 def wait_for_page_content(page) -> None:
     """
     Wait for useful page content.
+
+    The exam calendar page is a large, menu-heavy page and the calendar
+    widget itself is client-rendered well below the fold. On a page this
+    size, `networkidle` alone can resolve before the widget has actually
+    mounted (e.g. if it lazy-loads once scrolled into view), which was
+    producing false "0 events" results even though the page loaded fine.
+    So: wait for network idle, scroll through the page to trigger any
+    scroll-based lazy loading, then explicitly wait for a calendar
+    selector to appear before handing off to extraction.
     """
 
     logger.info(
@@ -468,7 +489,70 @@ def wait_for_page_content(page) -> None:
             "Continuing with available page content."
         )
 
+    _scroll_to_trigger_lazy_load(page)
+
+    _wait_for_calendar_widget(page)
+
     random_delay()
+
+
+def _scroll_to_trigger_lazy_load(page) -> None:
+    """
+    Scroll through the page in steps so any IntersectionObserver-based
+    lazy loading (common for below-the-fold widgets) has a chance to
+    fire, then scroll back up before extraction.
+    """
+
+    try:
+
+        height = page.evaluate("document.body.scrollHeight")
+        step = max(height // 6, 400)
+
+        for offset in range(0, height + step, step):
+            page.evaluate(f"window.scrollTo(0, {offset})")
+            page.wait_for_timeout(400)
+
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(500)
+
+    except Exception as exc:
+
+        logger.warning(
+            "Scroll-to-trigger-lazy-load step failed (continuing): %s",
+            exc
+        )
+
+
+def _wait_for_calendar_widget(page) -> None:
+    """
+    Explicitly wait for a calendar selector to appear, rather than
+    relying on a fixed random delay, since a fixed delay is either too
+    short (widget not mounted yet -> false "0 events") or wastefully
+    long. Logs but does not raise on timeout, so the existing DOM/text
+    extraction fallbacks still get a chance to run.
+    """
+
+    combined_selector = ", ".join(CALENDAR_SELECTORS)
+
+    try:
+
+        page.wait_for_selector(
+            combined_selector,
+            timeout=20_000,
+            state="attached",
+        )
+
+        logger.info(
+            "Calendar widget selector appeared."
+        )
+
+    except PlaywrightTimeoutError:
+
+        logger.warning(
+            "No calendar selector appeared within timeout. "
+            "The widget may not have mounted for this request; "
+            "falling back to whatever extraction can find."
+        )
 
 
 # ============================================================
@@ -483,13 +567,7 @@ def find_calendar_container(page) -> Optional[object]:
     selectors are attempted.
     """
 
-    selectors = [
-        ".fc",
-        ".fc-view-harness",
-        ".fc-view",
-        "[class*='calendar']",
-        "[id*='calendar']",
-    ]
+    selectors = CALENDAR_SELECTORS
 
     for selector in selectors:
 
