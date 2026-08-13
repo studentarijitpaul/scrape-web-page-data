@@ -1,4 +1,5 @@
 from change_detector import detect_changes, filter_allowed_exams, generate_exam_id, load_allowed_names, normalize_exam_name, should_notify
+from calendar_sync import deduplicate_rows_by_event_id
 
 
 def row(date="2026-08-20", exam="CAT", event="CAT exam", event_type="CAT exam"):
@@ -28,3 +29,7 @@ def test_stable_id_excludes_date_and_only_changes_notify():
     assert generate_exam_id(row("2026-08-20")) == generate_exam_id(row("2026-08-25"))
     assert should_notify("new") and should_notify("updated")
     assert not should_notify("unchanged") and not should_notify("removed")
+
+
+def test_calendar_rows_with_the_same_stable_id_are_collapsed():
+    assert deduplicate_rows_by_event_id([row("2026-08-01"), row("2026-08-02")]) == [row("2026-08-01")]
