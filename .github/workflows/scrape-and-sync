@@ -1,0 +1,332 @@
+name: Shiksha Exam Calendar — Scrape & Sync
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      delete_removed:
+        description: "Delete Calendar events no longer present in the Sheet"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+  schedule:
+    # 03:00 UTC = 08:30 AM IST
+    - cron: "0 3 * * *"
+
+
+jobs:
+
+  # ============================================================
+  # JOB 1: SCRAPE SHIKSHA EXAM CALENDAR
+  # ============================================================
+  scrape:
+    name: Run Scraper
+    runs-on: ubuntu-22.04
+
+    steps:
+
+      # --------------------------------------------------------
+      # Checkout repository
+      # --------------------------------------------------------
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # Setup Python
+      # --------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: ET/requirements.txt
+
+      # --------------------------------------------------------
+      # Install dependencies
+      # --------------------------------------------------------
+      - name: Install Python Dependencies
+        working-directory: ET
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # --------------------------------------------------------
+      # Install Playwright Chromium
+      # --------------------------------------------------------
+      - name: Install Playwright Browser
+        working-directory: ET
+        run: |
+          playwright install --with-deps chromium
+
+      # --------------------------------------------------------
+      # Run scraper
+      # --------------------------------------------------------
+      - name: Run Scraper
+        working-directory: ET
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
+        run: |
+          python scraper.py
+
+
+  # ============================================================
+  # JOB 2: SYNC GOOGLE SHEET → GOOGLE CALENDAR
+  # ============================================================
+  sync-calendar:
+    name: Sync to Google Calendar
+    needs: scrape
+    runs-on: ubuntu-22.04
+
+    env:
+      TZ: Asia/Kolkata
+
+    steps:
+
+      # --------------------------------------------------------
+      # Checkout repository
+      # --------------------------------------------------------
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # Setup Python
+      # --------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: ET/requirements.txt
+
+      # --------------------------------------------------------
+      # Install dependencies
+      # --------------------------------------------------------
+      - name: Install Python Dependencies
+        working-directory: ET
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # --------------------------------------------------------
+      # Check required GitHub Secrets
+      # --------------------------------------------------------
+      - name: Check Required Secrets
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+        run: |
+          echo "Checking required configuration..."
+
+          if [ -z "$GOOGLE_SERVICE_ACCOUNT_JSON" ]; then
+            echo "ERROR: GOOGLE_SERVICE_ACCOUNT_JSON secret is missing."
+            exit 1
+          fi
+
+          if [ -z "$GOOGLE_SHEET_ID" ]; then
+            echo "ERROR: GOOGLE_SHEET_ID secret is missing."
+            exit 1
+          fi
+
+          if [ -z "$GOOGLE_CALENDAR_ID" ]; then
+            echo "ERROR: GOOGLE_CALENDAR_ID secret is missing."
+            exit 1
+          fi
+
+          echo "GOOGLE_SERVICE_ACCOUNT_JSON: configured"
+          echo "GOOGLE_SHEET_ID: configured"
+          echo "GOOGLE_CALENDAR_ID: configured"
+
+      # --------------------------------------------------------
+      # Validate Calendar ID
+      # --------------------------------------------------------
+      - name: Validate Google Calendar ID
+        env:
+          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+        run: |
+          CALENDAR_ID="$(printf '%s' "$GOOGLE_CALENDAR_ID" | tr -d '\r\n' | xargs)"
+
+          echo "Calendar ID present: true"
+          echo "Calendar ID length: ${#CALENDAR_ID}"
+
+          if [ -z "$CALENDAR_ID" ]; then
+            echo "ERROR: GOOGLE_CALENDAR_ID is empty."
+            exit 1
+          fi
+
+          case "$CALENDAR_ID" in
+            *@group.calendar.google.com)
+              echo "Calendar ID format: OK"
+              ;;
+            *)
+              echo "WARNING: Calendar ID does not end with @group.calendar.google.com."
+              echo "This may still be valid for some Google Calendars."
+              ;;
+          esac
+
+      # --------------------------------------------------------
+      # Test Google Calendar access
+      # --------------------------------------------------------
+      - name: Test Google Calendar Access
+        working-directory: ET
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import sys
+
+          from google.oauth2.service_account import Credentials
+          from googleapiclient.discovery import build
+          from googleapiclient.errors import HttpError
+
+
+          print("==========================================")
+          print("Testing Google Calendar access")
+          print("==========================================")
+
+
+          # ----------------------------------------------------
+          # Read Calendar ID
+          # ----------------------------------------------------
+          calendar_id = os.environ.get("GOOGLE_CALENDAR_ID", "").strip()
+
+          if not calendar_id:
+              print("ERROR: GOOGLE_CALENDAR_ID is empty.")
+              sys.exit(1)
+
+
+          # ----------------------------------------------------
+          # Read service account credentials
+          # ----------------------------------------------------
+          service_account_json = os.environ.get(
+              "GOOGLE_SERVICE_ACCOUNT_JSON",
+              ""
+          ).strip()
+
+          if not service_account_json:
+              print("ERROR: GOOGLE_SERVICE_ACCOUNT_JSON is empty.")
+              sys.exit(1)
+
+
+          try:
+              credentials_info = json.loads(service_account_json)
+          except json.JSONDecodeError as e:
+              print("ERROR: GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.")
+              print(e)
+              sys.exit(1)
+
+
+          # ----------------------------------------------------
+          # Create Google credentials
+          # ----------------------------------------------------
+          credentials = Credentials.from_service_account_info(
+              credentials_info,
+              scopes=[
+                  "https://www.googleapis.com/auth/calendar"
+              ]
+          )
+
+
+          # ----------------------------------------------------
+          # Build Calendar API client
+          # ----------------------------------------------------
+          service = build(
+              "calendar",
+              "v3",
+              credentials=credentials,
+              cache_discovery=False
+          )
+
+
+          # ----------------------------------------------------
+          # Test calendar access
+          # ----------------------------------------------------
+          try:
+
+              calendar = service.calendars().get(
+                  calendarId=calendar_id
+              ).execute()
+
+              print("")
+              print("Google Calendar connection successful!")
+              print("")
+              print("Calendar Name:")
+              print(calendar.get("summary"))
+
+              print("")
+              print("Calendar ID:")
+              print(calendar.get("id"))
+
+              print("")
+              print("Calendar Timezone:")
+              print(calendar.get("timeZone"))
+
+              print("")
+              print("Calendar Access Test: PASSED")
+              print("")
+
+          except HttpError as e:
+
+              print("")
+              print("ERROR: Unable to access Google Calendar.")
+              print("")
+              print("HTTP Status:", e.resp.status)
+              print("Details:", e)
+              print("")
+              print("Make sure:")
+              print("1. GOOGLE_CALENDAR_ID is correct.")
+              print("2. The calendar is shared with the service account.")
+              print("3. The service account has 'Make changes to events' permission.")
+              print("4. Google Calendar API is enabled.")
+              print("")
+
+              sys.exit(1)
+
+          except Exception as e:
+
+              print("")
+              print("ERROR:", str(e))
+              print("")
+
+              sys.exit(1)
+
+          PY
+
+      # --------------------------------------------------------
+      # Run Calendar Sync
+      # --------------------------------------------------------
+      - name: Run Calendar Sync
+        working-directory: ET
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+          GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
+
+          SYNC_TIMEZONE: Asia/Kolkata
+
+          DELETE_REMOVED_EVENTS: ${{ github.event.inputs.delete_removed || 'false' }}
+
+        run: |
+          echo "=========================================="
+          echo "Starting Google Calendar synchronization"
+          echo "=========================================="
+
+          python calendar_sync.py
+
+          echo ""
+          echo "=========================================="
+          echo "Calendar synchronization completed"
+          echo "=========================================="
