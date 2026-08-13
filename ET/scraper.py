@@ -88,6 +88,17 @@ PAGE_TIMEOUT = 60_000
 MIN_DELAY = 1.0
 MAX_DELAY = 3.0
 
+# Retry settings: a Cloudflare/anti-bot challenge or a slow page load is
+# often transient, so a fresh browser session on the next attempt
+# frequently succeeds even when the previous one didn't.
+MAX_SCRAPE_ATTEMPTS = int(os.getenv("MAX_SCRAPE_ATTEMPTS", "3"))
+RETRY_BACKOFF_SECONDS = 15
+
+# Where to save a screenshot/HTML snapshot when every attempt still comes
+# back with zero events, so a failure can be diagnosed without needing to
+# reproduce it. Uploaded as a CI artifact by the GitHub Actions workflow.
+DEBUG_ARTIFACT_DIR = os.getenv("DEBUG_ARTIFACT_DIR", "debug_artifacts")
+
 
 # ============================================================
 # LOGGING
@@ -369,6 +380,19 @@ def create_browser_context(browser):
             "Chrome/151.0.0.0 "
             "Safari/537.36"
         ),
+    )
+
+    # Playwright's default Chromium exposes navigator.webdriver = true and a
+    # couple of other tells that basic bot-detection checks for. Masking
+    # them is a well-known, low-effort step that meaningfully reduces
+    # false-positive blocks on otherwise-legitimate scraping traffic.
+    context.add_init_script(
+        """
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        window.chrome = window.chrome || { runtime: {} };
+        """
     )
 
     return context
@@ -936,27 +960,44 @@ def clean_events(
 # SCRAPE
 # ============================================================
 
-def scrape_shiksha() -> List[Dict[str, str]]:
+def _capture_debug_snapshot(page, attempt: int) -> None:
     """
-    Main scraping function.
+    Save a screenshot + HTML dump of the current page state, so a zero-event
+    result can be diagnosed later (blocked/challenge page vs. genuinely
+    empty calendar vs. a structure change) without needing to reproduce it.
+    Never raises: a failed debug capture must not mask the real error.
     """
 
-    logger.info(
-        "=================================================="
-    )
+    try:
+        os.makedirs(DEBUG_ARTIFACT_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        prefix = os.path.join(DEBUG_ARTIFACT_DIR, f"attempt{attempt}-{stamp}")
 
-    logger.info(
-        "Shiksha Exam Calendar Scraper"
-    )
+        page.screenshot(path=f"{prefix}.png", full_page=True)
 
-    logger.info(
-        "Target month: %s",
-        TARGET_MONTH
-    )
+        with open(f"{prefix}.html", "w", encoding="utf-8") as fh:
+            fh.write(page.content())
 
-    logger.info(
-        "=================================================="
-    )
+        title = page.title()
+        url = page.url
+        with open(f"{prefix}.txt", "w", encoding="utf-8") as fh:
+            fh.write(f"URL: {url}\nTitle: {title}\n")
+
+        logger.warning(
+            "Saved debug snapshot for attempt %d to %s(.png/.html/.txt)",
+            attempt,
+            prefix,
+        )
+
+    except Exception as exc:
+        logger.warning("Could not save debug snapshot: %s", exc)
+
+
+def _scrape_shiksha_once(attempt: int) -> List[Dict[str, str]]:
+    """
+    Run a single scrape attempt in a fresh browser session.
+    Returns [] (never raises) if the attempt found no usable events.
+    """
 
     with sync_playwright() as playwright:
 
@@ -1040,8 +1081,10 @@ def scrape_shiksha() -> List[Dict[str, str]]:
             if not events:
 
                 logger.warning(
-                    "No rows found for %s.",
-                    TARGET_MONTH
+                    "No rows found for %s on attempt %d/%d.",
+                    TARGET_MONTH,
+                    attempt,
+                    MAX_SCRAPE_ATTEMPTS,
                 )
 
                 logger.warning(
@@ -1063,11 +1106,12 @@ def scrape_shiksha() -> List[Dict[str, str]]:
                 )
 
                 logger.warning(
-                    "4. The website blocked the request."
+                    "4. The website blocked the request "
+                    "(bot-detection / rate limiting)."
                 )
 
-                # Do not fail the GitHub workflow merely
-                # because no calendar events were found.
+                _capture_debug_snapshot(page, attempt)
+
                 return []
 
             return events
@@ -1083,6 +1127,57 @@ def scrape_shiksha() -> List[Dict[str, str]]:
                 browser.close()
             except Exception:
                 pass
+
+
+def scrape_shiksha() -> List[Dict[str, str]]:
+    """
+    Main scraping function. Retries up to MAX_SCRAPE_ATTEMPTS times with a
+    fresh browser session each time, since a Cloudflare/anti-bot challenge
+    or a slow/incomplete page load is often transient and a clean retry
+    frequently succeeds even when the previous attempt didn't. Only
+    returns [] (never raises) after every attempt has been exhausted.
+    """
+
+    logger.info(
+        "=================================================="
+    )
+
+    logger.info(
+        "Shiksha Exam Calendar Scraper"
+    )
+
+    logger.info(
+        "Target month: %s",
+        TARGET_MONTH
+    )
+
+    logger.info(
+        "=================================================="
+    )
+
+    for attempt in range(1, MAX_SCRAPE_ATTEMPTS + 1):
+
+        events = _scrape_shiksha_once(attempt)
+
+        if events:
+            return events
+
+        if attempt < MAX_SCRAPE_ATTEMPTS:
+            delay = RETRY_BACKOFF_SECONDS * attempt
+            logger.info(
+                "Retrying in %d second(s) (attempt %d/%d)...",
+                delay,
+                attempt + 1,
+                MAX_SCRAPE_ATTEMPTS,
+            )
+            time.sleep(delay)
+
+    logger.warning(
+        "All %d scrape attempt(s) returned zero events.",
+        MAX_SCRAPE_ATTEMPTS,
+    )
+
+    return []
 
 
 # ============================================================
