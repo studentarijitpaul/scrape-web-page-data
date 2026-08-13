@@ -14,6 +14,25 @@ SCOPES = [
 EXPECTED_HEADER = ["Date", "Exam", "Event", "Event Type", "Exam URL"]
 
 
+def deduplicate_sheet_rows(rows):
+    """Remove exact duplicate Sheet rows while preserving their first order.
+
+    A multi-day exam remains valid because its date is part of the key. Only
+    identical Date, Exam, Event, Event Type and Exam URL values are removed.
+    """
+    unique_rows = []
+    seen = set()
+    for row in rows:
+        key = tuple(str(row.get(field, "")).strip() for field in (
+            "date", "exam", "event", "event_type", "exam_url",
+        ))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(row)
+    return unique_rows
+
+
 def get_credentials():
     """
     Build and return a google-auth Credentials object from the
@@ -50,6 +69,15 @@ def get_google_sheet():
 
 
 def write_month_data(rows, month_label):
+    original_count = len(rows)
+    rows = deduplicate_sheet_rows(rows)
+    removed_count = original_count - len(rows)
+    if removed_count:
+        print(
+            f"Removed {removed_count} exact duplicate row(s) before writing "
+            f"Google Sheet tab '{month_label}'."
+        )
+
     spreadsheet = get_google_sheet()
 
     try:
