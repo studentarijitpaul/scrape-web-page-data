@@ -39,7 +39,9 @@ def main() -> int:
         if not scraped:
             raise RuntimeError("Scraper returned no events; refusing to treat this as removals.")
         candidate_rows = [row for item in scraped if (row := _row_from_scrape(item, allowed))]
-        rows = filter_allowed_exams(candidate_rows, allowed)
+        rows = google_sheets.deduplicate_sheet_rows(
+            filter_allowed_exams(candidate_rows, allowed)
+        )
         log.info("Scraped exams: %d | After Exam_Name filtering: %d", len(scraped), len(rows))
         previous = google_sheets.read_all_rows(TARGET_MONTH)
         changes = detect_changes(previous, rows)
