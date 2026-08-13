@@ -1,5 +1,6 @@
 from change_detector import detect_changes, filter_allowed_exams, generate_exam_id, load_allowed_names, normalize_exam_name, should_notify
 from calendar_sync import deduplicate_rows_by_event_id
+from google_sheets import deduplicate_sheet_rows
 
 
 def row(date="2026-08-20", exam="CAT", event="CAT exam", event_type="CAT exam"):
@@ -33,3 +34,9 @@ def test_stable_id_excludes_date_and_only_changes_notify():
 
 def test_calendar_rows_with_the_same_stable_id_are_collapsed():
     assert deduplicate_rows_by_event_id([row("2026-08-01"), row("2026-08-02")]) == [row("2026-08-01")]
+
+
+def test_only_exact_duplicate_sheet_rows_are_removed():
+    duplicate = row("2026-08-01")
+    different_date = row("2026-08-02")
+    assert deduplicate_sheet_rows([duplicate, duplicate, different_date]) == [duplicate, different_date]
