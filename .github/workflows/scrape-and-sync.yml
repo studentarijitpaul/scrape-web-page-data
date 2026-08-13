@@ -24,66 +24,17 @@ on:
 jobs:
 
   # ============================================================
-  # JOB 1: SCRAPE SHIKSHA EXAM CALENDAR
+  # JOB: SCRAPE -> SHEET -> CALENDAR -> CHAT (single entry point)
   # ============================================================
-  scrape:
-    name: Run Scraper
-    runs-on: ubuntu-22.04
-
-    steps:
-
-      # --------------------------------------------------------
-      # Checkout repository
-      # --------------------------------------------------------
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      # --------------------------------------------------------
-      # Setup Python
-      # --------------------------------------------------------
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: "pip"
-          cache-dependency-path: ET/requirements.txt
-
-      # --------------------------------------------------------
-      # Install dependencies
-      # --------------------------------------------------------
-      - name: Install Python Dependencies
-        working-directory: ET
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      # --------------------------------------------------------
-      # Install Playwright Chromium
-      # --------------------------------------------------------
-      - name: Install Playwright Browser
-        working-directory: ET
-        run: |
-          playwright install --with-deps chromium
-
-      # --------------------------------------------------------
-      # Run scraper
-      # --------------------------------------------------------
-      - name: Run Scraper
-        working-directory: ET
-        env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
-        run: |
-          python scraper.py
-
-
-  # ============================================================
-  # JOB 2: SYNC GOOGLE SHEET → GOOGLE CALENDAR
-  # ============================================================
-  sync-calendar:
-    name: Sync to Google Calendar
-    needs: scrape
+  # main.py is the orchestrator: it scrapes, filters against the
+  # Exam_Name allowlist, diffs against what's currently in the sheet
+  # (new / updated / unchanged / removed), writes the sheet, syncs the
+  # Calendar, and posts a Chat message for every new or changed exam.
+  # Do NOT call scraper.py or calendar_sync.py directly here - they
+  # skip the diffing step in change_detector.py and main.py's
+  # per-exam Chat notifications entirely.
+  sync:
+    name: Scrape, Sync Sheet/Calendar, Notify Chat
     runs-on: ubuntu-22.04
 
     env:
@@ -117,6 +68,15 @@ jobs:
           pip install -r requirements.txt
 
       # --------------------------------------------------------
+      # Install Playwright Chromium (needed by scraper.scrape_shiksha,
+      # which main.py imports and calls)
+      # --------------------------------------------------------
+      - name: Install Playwright Browser
+        working-directory: ET
+        run: |
+          playwright install --with-deps chromium
+
+      # --------------------------------------------------------
       # Check required GitHub Secrets
       # --------------------------------------------------------
       - name: Check Required Secrets
@@ -124,6 +84,7 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+          GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
         run: |
           echo "Checking required configuration..."
 
@@ -140,6 +101,10 @@ jobs:
           if [ -z "$GOOGLE_CALENDAR_ID" ]; then
             echo "ERROR: GOOGLE_CALENDAR_ID secret is missing."
             exit 1
+          fi
+
+          if [ -z "$GOOGLE_CHAT_WEBHOOK_URL" ]; then
+            echo "WARNING: GOOGLE_CHAT_WEBHOOK_URL secret is missing. The sync will still run, but no Chat notifications will be sent (google_chat.py fails soft)."
           fi
 
           echo "GOOGLE_SERVICE_ACCOUNT_JSON: configured"
@@ -305,9 +270,9 @@ jobs:
           PY
 
       # --------------------------------------------------------
-      # Run Calendar Sync
+      # Run the full pipeline: scrape -> diff -> Sheet -> Calendar -> Chat
       # --------------------------------------------------------
-      - name: Run Calendar Sync
+      - name: Run Sync (main.py)
         working-directory: ET
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -321,12 +286,12 @@ jobs:
 
         run: |
           echo "=========================================="
-          echo "Starting Google Calendar synchronization"
+          echo "Starting scrape -> Sheet -> Calendar -> Chat sync"
           echo "=========================================="
 
-          python calendar_sync.py
+          python main.py
 
           echo ""
           echo "=========================================="
-          echo "Calendar synchronization completed"
+          echo "Sync completed"
           echo "=========================================="
