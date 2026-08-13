@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import unicodedata
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -15,17 +17,19 @@ EXPECTED_HEADER = ["Date", "Exam", "Event", "Event Type", "Exam URL"]
 
 
 def deduplicate_sheet_rows(rows):
-    """Remove exact duplicate Sheet rows while preserving their first order.
+    """Keep only one row per normalized Date + Exam in a month worksheet.
 
-    A multi-day exam remains valid because its date is part of the key. Only
-    identical Date, Exam, Event, Event Type and Exam URL values are removed.
+    Shiksha sometimes repeats the same exam card with slightly different or
+    invisible text/URL formatting. Those variants must not create multiple
+    rows. A multi-day exam is still retained because its date is different.
     """
     unique_rows = []
     seen = set()
     for row in rows:
-        key = tuple(str(row.get(field, "")).strip() for field in (
-            "date", "exam", "event", "event_type", "exam_url",
-        ))
+        date_value = str(row.get("date", "")).strip()
+        exam_value = unicodedata.normalize("NFKC", str(row.get("exam", "")))
+        exam_value = re.sub(r"[\s\-_./,;:()\[\]{}]+", " ", exam_value.casefold()).strip()
+        key = (date_value, exam_value)
         if key in seen:
             continue
         seen.add(key)
@@ -74,7 +78,7 @@ def write_month_data(rows, month_label):
     removed_count = original_count - len(rows)
     if removed_count:
         print(
-            f"Removed {removed_count} exact duplicate row(s) before writing "
+            f"Removed {removed_count} duplicate Date + Exam row(s) before writing "
             f"Google Sheet tab '{month_label}'."
         )
 
