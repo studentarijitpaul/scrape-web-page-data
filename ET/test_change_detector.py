@@ -36,7 +36,9 @@ def test_calendar_rows_with_the_same_stable_id_are_collapsed():
     assert deduplicate_rows_by_event_id([row("2026-08-01"), row("2026-08-02")]) == [row("2026-08-01")]
 
 
-def test_only_exact_duplicate_sheet_rows_are_removed():
+def test_one_exam_is_kept_per_date_even_when_source_metadata_differs():
+    first = row("2026-08-01")
     duplicate = row("2026-08-01")
+    duplicate["exam_url"] = "https://example.test/variant"
     different_date = row("2026-08-02")
-    assert deduplicate_sheet_rows([duplicate, duplicate, different_date]) == [duplicate, different_date]
+    assert deduplicate_sheet_rows([first, duplicate, different_date]) == [first, different_date]
