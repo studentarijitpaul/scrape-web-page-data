@@ -188,6 +188,35 @@ def parse_row_date(
         return None
 
 
+def deduplicate_rows_by_event_id(rows: list[dict]) -> list[dict]:
+    """Keep one row for each stable Calendar identity in a single run.
+
+    Some Shiksha calendar exports repeat an exam on multiple dates with the
+    same event type.  Those rows intentionally resolve to one stable ID, so
+    trying to insert each of them causes a Google Calendar HTTP 409 conflict.
+    Input is already date-ordered; retaining the first valid row makes the
+    result deterministic and prevents an accidental date-dependent identity.
+    """
+    unique_rows: list[dict] = []
+    seen_ids: set[str] = set()
+    for row in rows:
+        event_id = make_event_id(
+            str(row.get("exam", "")),
+            str(row.get("date", "")),
+            str(row.get("event_type", "")),
+        )
+        if event_id in seen_ids:
+            log.warning(
+                "Skipping duplicate stable event identity: %s (%s)",
+                row.get("exam", ""),
+                row.get("date", ""),
+            )
+            continue
+        seen_ids.add(event_id)
+        unique_rows.append(row)
+    return unique_rows
+
+
 # ============================================================
 # SHEET ROW -> CALENDAR EVENT
 # ============================================================
@@ -823,6 +852,14 @@ def run_sync(rows: Optional[list[dict]] = None, tab_name: Optional[str] = None) 
 
         return stats
 
+    original_row_count = len(rows)
+    rows = deduplicate_rows_by_event_id(rows)
+    if len(rows) != original_row_count:
+        log.info(
+            "Collapsed %d duplicate row(s) sharing a stable event identity.",
+            original_row_count - len(rows),
+        )
+
     # --------------------------------------------------------
     # Build Calendar API service
     # --------------------------------------------------------
@@ -985,12 +1022,16 @@ def run_sync(rows: Optional[list[dict]] = None, tab_name: Optional[str] = None) 
 
             if existing_event is None:
 
-                create_event(
+                created_event = create_event(
                     service,
                     calendar_id,
                     event_id,
                     body,
                 )
+
+                # A later duplicate in the same process must see this event
+                # as existing rather than attempting another insert.
+                existing_events[event_id] = created_event
 
                 stats.created += 1
 
