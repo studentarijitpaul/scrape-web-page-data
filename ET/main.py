@@ -3,35 +3,54 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import sys
 
 import calendar_sync
 import google_chat
 import google_sheets
 import scraper
-from change_detector import detect_changes, filter_allowed_exams, load_allowed_names
+from change_detector import detect_changes, filter_allowed_exams, load_allowed_names, normalize_exam_name
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("main")
 TARGET_MONTH = os.getenv("TARGET_MONTH", "August 2026")
 
 
-def _row_from_scrape(item: dict, allowed: set[str]) -> dict | None:
-    # Shiksha's rendered title is the only name field supplied by the existing scraper.
-    title = (item.get("label") or item.get("Event") or "").strip()
-    normalized_title = re.sub(r"[^\w]+", " ", title.casefold()).strip()
-    matches = [name for name in allowed if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", normalized_title)]
-    if len(matches) != 1:
+def _row_from_scrape(item: dict, allowed: set[str], canonical_names: dict[str, str]) -> dict | None:
+    """Convert one Shiksha table row into the normalized sheet schema.
+
+    Shiksha's table has separate Label (exam) and Event columns.  The old
+    implementation incorrectly searched the Event text for the exam name,
+    which made legitimate rows disappear when the event title did not repeat
+    the label.
+    """
+    label = str(item.get("label") or "").strip()
+    event_text = str(item.get("Event") or "").strip()
+    date = str(item.get("date") or "").strip()
+    if not date or not label or not event_text:
         return None
-    exam = matches[0]
-    return {"date": item.get("date", "").strip(), "exam": exam.upper(), "event": title, "event_type": title, "exam_url": ""}
+
+    normalized_label = normalize_exam_name(label)
+    if normalized_label not in allowed:
+        return None
+
+    # Keep the spelling/casing used in the Exam_Name worksheet.
+    exam = canonical_names.get(normalized_label, label)
+    return {
+        "date": date,
+        "exam": exam,
+        "event": event_text,
+        "event_type": event_text,
+        "exam_url": "",
+    }
 
 
 def main() -> int:
     try:
         log.info("Shiksha Exam Calendar Sync | Target Month: %s", TARGET_MONTH)
-        allowed = load_allowed_names(google_sheets.read_exam_names())
+        raw_allowed = google_sheets.read_exam_names()
+        canonical_names = {normalize_exam_name(value): str(value).strip() for value in raw_allowed if str(value).strip()}
+        allowed = set(canonical_names)
         log.info("Allowed exams: %d", len(allowed))
         if not allowed:
             raise RuntimeError("Exam_Name is empty; refusing to overwrite the month worksheet.")
@@ -62,11 +81,23 @@ def main() -> int:
             )
             return 0
 
-        candidate_rows = [row for item in scraped if (row := _row_from_scrape(item, allowed))]
+        candidate_rows = [row for item in scraped if (row := _row_from_scrape(item, allowed, canonical_names))]
         rows = google_sheets.deduplicate_sheet_rows(
             filter_allowed_exams(candidate_rows, allowed)
         )
-        log.info("Scraped exams: %d | After Exam_Name filtering: %d", len(scraped), len(rows))
+        log.info("Scraped events: %d | After Exam_Name filtering: %d", len(scraped), len(rows))
+
+        # Never erase a previously good month because the source structure
+        # changed or the Exam_Name allowlist stopped matching. A successful
+        # scrape with zero allowed rows is a data-integrity failure, not an
+        # empty month.
+        if scraped and not rows:
+            raise RuntimeError(
+                f"Scraper returned {len(scraped)} event(s), but 0 matched the Exam_Name allowlist. "
+                "Refusing to overwrite the month worksheet. Check the Shiksha Label column "
+                "and the Exam_Name worksheet."
+            )
+
         previous = google_sheets.read_all_rows(TARGET_MONTH)
         changes = detect_changes(previous, rows)
         log.info("New=%d Updated=%d Unchanged=%d Removed=%d", *(len(changes[k]) for k in ("new", "updated", "unchanged", "removed")))
