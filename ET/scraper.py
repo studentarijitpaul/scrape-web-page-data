@@ -88,15 +88,21 @@ PAGE_TIMEOUT = 60_000
 MIN_DELAY = 1.0
 MAX_DELAY = 3.0
 
-# Retry settings: a Cloudflare/anti-bot challenge or a slow page load is
-# often transient, so a fresh browser session on the next attempt
-# frequently succeeds even when the previous one didn't.
+# Retry settings: a WAF/anti-bot challenge or a slow page load is
+# sometimes transient, so a fresh browser session on the next attempt
+# can succeed even when the previous one didn't. NOTE: if Shiksha (or a
+# CDN/WAF in front of it) is blocking by IP reputation rather than by
+# session/fingerprint, retries from the SAME GitHub Actions runner will
+# keep hitting the same source IP and will keep failing — see the 403
+# diagnostics captured below.
 MAX_SCRAPE_ATTEMPTS = int(os.getenv("MAX_SCRAPE_ATTEMPTS", "3"))
 RETRY_BACKOFF_SECONDS = 15
 
-# Where to save a screenshot/HTML snapshot when every attempt still comes
-# back with zero events, so a failure can be diagnosed without needing to
-# reproduce it. Uploaded as a CI artifact by the GitHub Actions workflow.
+# Where to save a screenshot/HTML/response-header dump when a scrape
+# attempt returns zero events, so a failure (blocked page vs. genuinely
+# empty calendar vs. a structure change) can be diagnosed from the
+# GitHub Actions run itself instead of guessing. Uploaded as a CI
+# artifact by the workflow.
 DEBUG_ARTIFACT_DIR = os.getenv("DEBUG_ARTIFACT_DIR", "debug_artifacts")
 
 
@@ -382,19 +388,6 @@ def create_browser_context(browser):
         ),
     )
 
-    # Playwright's default Chromium exposes navigator.webdriver = true and a
-    # couple of other tells that basic bot-detection checks for. Masking
-    # them is a well-known, low-effort step that meaningfully reduces
-    # false-positive blocks on otherwise-legitimate scraping traffic.
-    context.add_init_script(
-        """
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        window.chrome = window.chrome || { runtime: {} };
-        """
-    )
-
     return context
 
 
@@ -402,15 +395,27 @@ def create_browser_context(browser):
 # PAGE LOADING
 # ============================================================
 
-def load_shiksha_page(page) -> None:
+def load_shiksha_page(page) -> bool:
     """
     Load the Shiksha exam calendar page.
+
+    Returns True if the response looked like a genuine page load, False
+    if the response status indicates the request was blocked (403/429)
+    or errored server-side (5xx). This distinction matters: a 403 on the
+    very first navigation means the *document itself* was refused by
+    Shiksha or a WAF/CDN in front of it, before any client-side
+    JavaScript ran. No amount of waiting for selectors or scrolling to
+    trigger lazy-loading can produce calendar data in that case, because
+    there was never a real calendar page in the response — only a
+    block/challenge page.
     """
 
     logger.info(
         "Fetching [%s] ...",
         SHIKSHA_URL
     )
+
+    blocked = False
 
     try:
 
@@ -426,7 +431,33 @@ def load_shiksha_page(page) -> None:
                 response.status
             )
 
+            if response.status in (403, 429) or response.status >= 500:
+                blocked = True
+
+                logger.warning(
+                    "[WEBSITE] Non-success status %s on the initial "
+                    "document request. This is a source/WAF-side "
+                    "response, not a client-rendering issue.",
+                    response.status,
+                )
+
+                # A handful of response headers are enough to tell a
+                # generic Shiksha-side 403 apart from a named WAF/CDN
+                # challenge (Cloudflare, Akamai, Imperva, etc.) without
+                # doing anything beyond reading headers Playwright
+                # already received.
+                headers = response.headers
+                for header_name in ("server", "cf-ray", "cf-mitigated", "x-akamai-transaction-id", "x-iinfo"):
+                    if header_name in headers:
+                        logger.warning(
+                            "[WEBSITE] Response header %s: %s",
+                            header_name,
+                            headers[header_name],
+                        )
+
         random_delay()
+
+        return blocked
 
     except PlaywrightTimeoutError:
 
@@ -434,6 +465,8 @@ def load_shiksha_page(page) -> None:
             "Page load timed out. "
             "Continuing because the page may still be usable."
         )
+
+        return False
 
     except Exception as exc:
 
@@ -445,30 +478,9 @@ def load_shiksha_page(page) -> None:
         raise
 
 
-# Selectors that indicate the FullCalendar widget has actually mounted.
-# Shared by the explicit wait below and by find_calendar_container(), so
-# the two stay in sync if Shiksha changes its markup again.
-CALENDAR_SELECTORS = [
-    ".fc",
-    ".fc-view-harness",
-    ".fc-view",
-    "[class*='calendar']",
-    "[id*='calendar']",
-]
-
-
 def wait_for_page_content(page) -> None:
     """
     Wait for useful page content.
-
-    The exam calendar page is a large, menu-heavy page and the calendar
-    widget itself is client-rendered well below the fold. On a page this
-    size, `networkidle` alone can resolve before the widget has actually
-    mounted (e.g. if it lazy-loads once scrolled into view), which was
-    producing false "0 events" results even though the page loaded fine.
-    So: wait for network idle, scroll through the page to trigger any
-    scroll-based lazy loading, then explicitly wait for a calendar
-    selector to appear before handing off to extraction.
     """
 
     logger.info(
@@ -489,70 +501,7 @@ def wait_for_page_content(page) -> None:
             "Continuing with available page content."
         )
 
-    _scroll_to_trigger_lazy_load(page)
-
-    _wait_for_calendar_widget(page)
-
     random_delay()
-
-
-def _scroll_to_trigger_lazy_load(page) -> None:
-    """
-    Scroll through the page in steps so any IntersectionObserver-based
-    lazy loading (common for below-the-fold widgets) has a chance to
-    fire, then scroll back up before extraction.
-    """
-
-    try:
-
-        height = page.evaluate("document.body.scrollHeight")
-        step = max(height // 6, 400)
-
-        for offset in range(0, height + step, step):
-            page.evaluate(f"window.scrollTo(0, {offset})")
-            page.wait_for_timeout(400)
-
-        page.evaluate("window.scrollTo(0, 0)")
-        page.wait_for_timeout(500)
-
-    except Exception as exc:
-
-        logger.warning(
-            "Scroll-to-trigger-lazy-load step failed (continuing): %s",
-            exc
-        )
-
-
-def _wait_for_calendar_widget(page) -> None:
-    """
-    Explicitly wait for a calendar selector to appear, rather than
-    relying on a fixed random delay, since a fixed delay is either too
-    short (widget not mounted yet -> false "0 events") or wastefully
-    long. Logs but does not raise on timeout, so the existing DOM/text
-    extraction fallbacks still get a chance to run.
-    """
-
-    combined_selector = ", ".join(CALENDAR_SELECTORS)
-
-    try:
-
-        page.wait_for_selector(
-            combined_selector,
-            timeout=20_000,
-            state="attached",
-        )
-
-        logger.info(
-            "Calendar widget selector appeared."
-        )
-
-    except PlaywrightTimeoutError:
-
-        logger.warning(
-            "No calendar selector appeared within timeout. "
-            "The widget may not have mounted for this request; "
-            "falling back to whatever extraction can find."
-        )
 
 
 # ============================================================
@@ -567,7 +516,13 @@ def find_calendar_container(page) -> Optional[object]:
     selectors are attempted.
     """
 
-    selectors = CALENDAR_SELECTORS
+    selectors = [
+        ".fc",
+        ".fc-view-harness",
+        ".fc-view",
+        "[class*='calendar']",
+        "[id*='calendar']",
+    ]
 
     for selector in selectors:
 
@@ -1038,12 +993,14 @@ def clean_events(
 # SCRAPE
 # ============================================================
 
-def _capture_debug_snapshot(page, attempt: int) -> None:
+def _capture_debug_snapshot(page, attempt: int, blocked: bool) -> None:
     """
-    Save a screenshot + HTML dump of the current page state, so a zero-event
-    result can be diagnosed later (blocked/challenge page vs. genuinely
-    empty calendar vs. a structure change) without needing to reproduce it.
-    Never raises: a failed debug capture must not mask the real error.
+    Save a screenshot + HTML dump + response metadata for the current
+    page state, so a zero-event result can be diagnosed later (blocked
+    page vs. genuinely empty calendar vs. a structure change) without
+    needing to reproduce it. Never raises: a failed debug capture must
+    never mask the real error. Never writes secrets — only page URL,
+    title, and rendered content.
     """
 
     try:
@@ -1056,13 +1013,13 @@ def _capture_debug_snapshot(page, attempt: int) -> None:
         with open(f"{prefix}.html", "w", encoding="utf-8") as fh:
             fh.write(page.content())
 
-        title = page.title()
-        url = page.url
         with open(f"{prefix}.txt", "w", encoding="utf-8") as fh:
-            fh.write(f"URL: {url}\nTitle: {title}\n")
+            fh.write(f"URL: {page.url}\nTitle: {page.title()}\nLikely blocked: {blocked}\n")
 
         logger.warning(
-            "Saved debug snapshot for attempt %d to %s(.png/.html/.txt)",
+            "Saved debug snapshot for attempt %d to %s(.png/.html/.txt). "
+            "If 'Likely blocked' is True, open the .png first — it will "
+            "usually show a WAF/challenge page rather than the calendar.",
             attempt,
             prefix,
         )
@@ -1071,10 +1028,14 @@ def _capture_debug_snapshot(page, attempt: int) -> None:
         logger.warning("Could not save debug snapshot: %s", exc)
 
 
-def _scrape_shiksha_once(attempt: int) -> List[Dict[str, str]]:
+def _scrape_shiksha_once(attempt: int) -> tuple[List[Dict[str, str]], bool]:
     """
     Run a single scrape attempt in a fresh browser session.
-    Returns [] (never raises) if the attempt found no usable events.
+
+    Returns (events, blocked). events is [] (never raises) if the
+    attempt found no usable events. blocked is True if the initial
+    document request itself returned 403/429/5xx — i.e. the page never
+    rendered a calendar to extract from in the first place.
     """
 
     with sync_playwright() as playwright:
@@ -1095,7 +1056,7 @@ def _scrape_shiksha_once(attempt: int) -> List[Dict[str, str]]:
 
         try:
 
-            load_shiksha_page(
+            blocked = load_shiksha_page(
                 page
             )
 
@@ -1165,34 +1126,25 @@ def _scrape_shiksha_once(attempt: int) -> List[Dict[str, str]]:
                     MAX_SCRAPE_ATTEMPTS,
                 )
 
-                logger.warning(
-                    "Possible reasons:"
-                )
+                if blocked:
+                    logger.warning(
+                        "Reason: the initial page request itself was "
+                        "refused (403/429/5xx) — this is a source/WAF "
+                        "block, not a selector or timing problem."
+                    )
+                else:
+                    logger.warning(
+                        "Possible reasons: (1) Shiksha has not published "
+                        "calendar data for this month, (2) the page "
+                        "structure changed, (3) calendar data now loads "
+                        "from an endpoint these extractors don't cover."
+                    )
 
-                logger.warning(
-                    "1. Shiksha has not published "
-                    "calendar data for this month."
-                )
+                _capture_debug_snapshot(page, attempt, blocked)
 
-                logger.warning(
-                    "2. Website structure has changed."
-                )
+                return [], blocked
 
-                logger.warning(
-                    "3. Calendar data is loaded "
-                    "dynamically through another API."
-                )
-
-                logger.warning(
-                    "4. The website blocked the request "
-                    "(bot-detection / rate limiting)."
-                )
-
-                _capture_debug_snapshot(page, attempt)
-
-                return []
-
-            return events
+            return events, blocked
 
         finally:
 
@@ -1210,10 +1162,9 @@ def _scrape_shiksha_once(attempt: int) -> List[Dict[str, str]]:
 def scrape_shiksha() -> List[Dict[str, str]]:
     """
     Main scraping function. Retries up to MAX_SCRAPE_ATTEMPTS times with a
-    fresh browser session each time, since a Cloudflare/anti-bot challenge
-    or a slow/incomplete page load is often transient and a clean retry
-    frequently succeeds even when the previous attempt didn't. Only
-    returns [] (never raises) after every attempt has been exhausted.
+    fresh browser session each time. Only returns [] (never raises) after
+    every attempt is exhausted — callers (main.py) treat an empty result
+    as a scrape failure and refuse to touch the Sheet/Calendar.
     """
 
     logger.info(
@@ -1233,9 +1184,12 @@ def scrape_shiksha() -> List[Dict[str, str]]:
         "=================================================="
     )
 
+    was_blocked = False
+
     for attempt in range(1, MAX_SCRAPE_ATTEMPTS + 1):
 
-        events = _scrape_shiksha_once(attempt)
+        events, blocked = _scrape_shiksha_once(attempt)
+        was_blocked = was_blocked or blocked
 
         if events:
             return events
@@ -1254,6 +1208,16 @@ def scrape_shiksha() -> List[Dict[str, str]]:
         "All %d scrape attempt(s) returned zero events.",
         MAX_SCRAPE_ATTEMPTS,
     )
+
+    if was_blocked:
+        logger.warning(
+            "At least one attempt was blocked at the HTTP level "
+            "(403/429/5xx). Retrying from the same GitHub Actions "
+            "runner will keep hitting the same source IP, so if this "
+            "is an IP-reputation block, further retries here will not "
+            "help — see debug_artifacts for the exact response Shiksha "
+            "returned."
+        )
 
     return []
 
