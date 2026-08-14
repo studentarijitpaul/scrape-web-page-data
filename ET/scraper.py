@@ -107,6 +107,7 @@ IMPORTANT CI setup note:
 import os
 import sys
 import json
+import re
 import time
 import random
 import logging
@@ -848,6 +849,168 @@ def find_calendar_container(page) -> Optional[object]:
 
 
 # ============================================================
+# TEXT-BASED DATE EXTRACTION (fallback when no date attribute exists)
+# ============================================================
+
+# The August 14 run confirmed Shiksha's calendar page is NOT built on
+# FullCalendar (0 raw FullCalendar events every attempt) and does not
+# expose a `data-date` attribute anywhere near its event elements (12
+# DOM-fallback events found, 0 survived date filtering — every one had
+# an empty date). That means the date almost certainly lives in the
+# *visible text* of each event ("15 Aug 2026 - JEE Advanced Result"
+# style), not in an attribute. This module extracts it from there.
+
+_MONTH_NAMES = (
+    "January|February|March|April|May|June|July|August|September|"
+    "October|November|December|"
+    "Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec"
+)
+
+# Ordered by specificity. Each pattern requires an explicit 4-digit
+# year in the matched text — dates without a year are deliberately not
+# guessed at, since silently assuming TARGET_MONTH's year for a date
+# that didn't actually state one risks mis-filing events into the
+# wrong month/year rather than just dropping them.
+_DATE_TEXT_PATTERNS = [
+    # 2026-08-15
+    re.compile(r"\b(\d{4}-\d{1,2}-\d{1,2})\b"),
+    # 15/08/2026 or 15-08-2026
+    re.compile(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{4})\b"),
+    # 15th August 2026 / 15 Aug 2026 / 15 Aug, 2026
+    re.compile(
+        rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_NAMES})\.?,?\s+(\d{{4}})\b",
+        re.IGNORECASE,
+    ),
+    # August 15, 2026 / Aug 15 2026
+    re.compile(
+        rf"\b({_MONTH_NAMES})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})\b",
+        re.IGNORECASE,
+    ),
+]
+
+_MONTH_LOOKUP = {
+    name[:3].lower(): index
+    for index, name in enumerate(
+        [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November",
+            "December",
+        ],
+        start=1,
+    )
+}
+_MONTH_LOOKUP["sept"] = 9
+
+
+def extract_date_from_text(text: str) -> str:
+    """
+    Search free text for a date that includes an explicit 4-digit
+    year, and normalize it to YYYY-MM-DD. Returns "" if no confident
+    match is found — this deliberately does not guess a year, so an
+    event whose text has no year is left for a human to look at (via
+    the debug snapshot) rather than silently mis-filed.
+    """
+
+    if not text:
+        return ""
+
+    for pattern in _DATE_TEXT_PATTERNS:
+
+        match = pattern.search(text)
+
+        if not match:
+            continue
+
+        groups = match.groups()
+
+        try:
+
+            if len(groups) == 1:
+                # ISO or D/M/Y-style single captured token — let
+                # normalize_date's strptime table handle it.
+                candidate = normalize_date(groups[0])
+
+                if candidate and candidate != groups[0]:
+                    return candidate
+
+                # normalize_date returned the value unchanged, meaning
+                # none of its formats matched (e.g. D/M/Y ambiguity) —
+                # try both day-first and month-first before giving up.
+                raw = groups[0].replace("-", "/")
+
+                for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"):
+                    try:
+                        return datetime.strptime(
+                            raw, fmt
+                        ).strftime("%Y-%m-%d")
+                    except ValueError:
+                        continue
+
+                continue
+
+            if len(groups) == 3 and groups[0].isdigit():
+                # (day, month name, year)
+                day, month_name, year = groups
+                month_num = _MONTH_LOOKUP.get(month_name[:4].lower())
+                if month_num is None:
+                    month_num = _MONTH_LOOKUP.get(month_name[:3].lower())
+
+            else:
+                # (month name, day, year)
+                month_name, day, year = groups
+                month_num = _MONTH_LOOKUP.get(month_name[:4].lower())
+                if month_num is None:
+                    month_num = _MONTH_LOOKUP.get(month_name[:3].lower())
+
+            if month_num is None:
+                continue
+
+            return datetime(
+                int(year), month_num, int(day)
+            ).strftime("%Y-%m-%d")
+
+        except (ValueError, KeyError):
+            continue
+
+    return ""
+
+
+# JS-side attribute probe shared by both extraction paths: checks a
+# much wider set of date-ish attributes than just FullCalendar's
+# `data-date`, plus any nested/ancestor <time datetime="..."> element,
+# since custom (non-FullCalendar) calendar widgets commonly use one of
+# these instead.
+_DATE_ATTR_PROBE_JS = """
+el => {
+    const dateAttrs = [
+        'data-date', 'data-day', 'data-start', 'data-startdate',
+        'data-event-date', 'data-eventdate', 'data-datetime',
+    ];
+
+    for (const attr of dateAttrs) {
+        const withAttr = el.closest(`[${attr}]`);
+        if (withAttr) {
+            const value = withAttr.getAttribute(attr);
+            if (value) return value;
+        }
+    }
+
+    const timeEl = el.querySelector('time[datetime]')
+        || el.closest('time[datetime]')
+        || (el.closest('[class*="event"]')
+            && el.closest('[class*="event"]').querySelector('time[datetime]'));
+
+    if (timeEl) {
+        const value = timeEl.getAttribute('datetime');
+        if (value) return value;
+    }
+
+    return '';
+}
+"""
+
+
+# ============================================================
 # FULLCALENDAR EXTRACTION
 # ============================================================
 
@@ -862,9 +1025,11 @@ def extract_fullcalendar_events(page) -> List[Dict[str, str]]:
         "Attempting FullCalendar event extraction..."
     )
 
-    script = """
-    () => {
+    script = (
+        """
+    (dateAttrProbe) => {
         const results = [];
+        const probeFn = new Function('el', 'return (' + dateAttrProbe + ')(el)');
 
         // ----------------------------------------------------
         // Read rendered event elements.
@@ -884,25 +1049,16 @@ def extract_fullcalendar_events(page) -> List[Dict[str, str]]:
 
             let date = '';
 
-            const parent = element.closest(
-                '[data-date]'
-            );
-
-            if (parent) {
-                date = parent.getAttribute(
-                    'data-date'
-                ) || '';
+            const dayCell = element.closest('.fc-daygrid-day');
+            if (dayCell) {
+                date = dayCell.getAttribute('data-date') || '';
             }
 
             if (!date) {
-                const dayCell = element.closest(
-                    '.fc-daygrid-day'
-                );
-
-                if (dayCell) {
-                    date = dayCell.getAttribute(
-                        'data-date'
-                    ) || '';
+                try {
+                    date = probeFn(element) || '';
+                } catch (e) {
+                    date = '';
                 }
             }
 
@@ -916,11 +1072,13 @@ def extract_fullcalendar_events(page) -> List[Dict[str, str]]:
         return results;
     }
     """
+    )
 
     try:
 
         events = page.evaluate(
-            script
+            script,
+            _DATE_ATTR_PROBE_JS,
         )
 
     except Exception as exc:
@@ -935,6 +1093,15 @@ def extract_fullcalendar_events(page) -> List[Dict[str, str]]:
     if not isinstance(events, list):
 
         return []
+
+    # Text-based fallback for anything the attribute probe missed —
+    # see extract_date_from_text()'s docstring for why this only fires
+    # when the label text itself contains an explicit year.
+    for event in events:
+        if not event.get("date"):
+            event["date"] = extract_date_from_text(
+                event.get("label", "")
+            )
 
     logger.info(
         "Raw rendered calendar events found: %d",
@@ -1003,23 +1170,21 @@ def extract_dom_events(page) -> List[Dict[str, str]]:
 
                     try:
 
-                        date = element.evaluate(
-                            """
-                            el => {
-                                const parent =
-                                    el.closest('[data-date]');
-                                return parent
-                                    ? parent.getAttribute('data-date')
-                                    : '';
-                            }
-                            """
-                        )
+                        date = element.evaluate(_DATE_ATTR_PROBE_JS)
 
                     except Exception:
                         pass
 
+                    date = date or ""
+
+                    # Text-based fallback — see extract_date_from_text()'s
+                    # docstring for why this requires an explicit year
+                    # in the text rather than guessing one.
+                    if not date:
+                        date = extract_date_from_text(text)
+
                     events.append({
-                        "date": date or "",
+                        "date": date,
                         "label": text,
                         "Event": text,
                     })
@@ -1081,7 +1246,7 @@ def extract_calendar_text(page) -> List[Dict[str, str]]:
             for line in lines:
 
                 results.append({
-                    "date": "",
+                    "date": extract_date_from_text(line),
                     "label": line,
                     "Event": line,
                 })
@@ -1281,7 +1446,12 @@ def clean_events(
 # SCRAPE
 # ============================================================
 
-def _capture_debug_snapshot(page, attempt: int, blocked: bool) -> None:
+def _capture_debug_snapshot(
+    page,
+    attempt: int,
+    blocked: bool,
+    raw_events: Optional[List[Dict[str, str]]] = None,
+) -> None:
     """
     Save a screenshot + HTML dump + a short metadata file for the
     current page state, so a zero-event result can be diagnosed later
@@ -1289,6 +1459,13 @@ def _capture_debug_snapshot(page, attempt: int, blocked: bool) -> None:
     without needing to reproduce it. Never raises: a failed debug
     capture must never mask the real error. Never writes secrets —
     only the page URL, title, and rendered content.
+
+    If raw_events is given (the events found BEFORE month-filtering),
+    they're also dumped to a .json file. This is what makes a
+    zero-after-filtering result diagnosable from the run log/artifact
+    alone: it shows exactly what label/date each scraped element had,
+    so a wrong date-extraction guess can be fixed precisely on the
+    next pass instead of re-guessing blind.
     """
 
     try:
@@ -1310,13 +1487,20 @@ def _capture_debug_snapshot(page, attempt: int, blocked: bool) -> None:
                 f"Likely blocked: {blocked}\n"
             )
 
+        if raw_events is not None:
+            with open(f"{prefix}.raw_events.json", "w", encoding="utf-8") as fh:
+                json.dump(raw_events, fh, indent=2, ensure_ascii=False)
+
         logger.warning(
-            "Saved debug snapshot for attempt %d to %s(.png/.html/.txt). "
-            "If 'Likely blocked' is True, check the .png first — it "
-            "will usually show a WAF/challenge page rather than the "
-            "calendar.",
+            "Saved debug snapshot for attempt %d to %s"
+            "(.png/.html/.txt%s). If 'Likely blocked' is True, check "
+            "the .png first — it will usually show a WAF/challenge "
+            "page rather than the calendar. Otherwise check "
+            ".raw_events.json to see exactly what date/label each "
+            "scraped element had before filtering.",
             attempt,
             prefix,
+            "/.raw_events.json" if raw_events is not None else "",
         )
 
     except Exception as exc:
@@ -1400,6 +1584,35 @@ def _scrape_shiksha_once(attempt: int) -> Tuple[List[Dict[str, str]], bool]:
                 )
 
             # ------------------------------------------------
+            # Log what was actually scraped BEFORE filtering, so a
+            # zero-after-filtering result is diagnosable from the run
+            # log alone instead of requiring a screenshot every time.
+            # ------------------------------------------------
+
+            raw_events = events
+
+            logger.info(
+                "Raw events before %s filtering: %d",
+                TARGET_MONTH,
+                len(raw_events),
+            )
+
+            for raw_event in raw_events[:20]:
+                logger.info(
+                    "  raw: date=%r label=%r",
+                    raw_event.get("date", ""),
+                    (raw_event.get("label", "") or "")[:80],
+                )
+
+            if len(raw_events) > 20:
+                logger.info(
+                    "  ... and %d more raw event(s) (see "
+                    ".raw_events.json in the debug snapshot for the "
+                    "full list if this attempt ends up with 0 rows)",
+                    len(raw_events) - 20,
+                )
+
+            # ------------------------------------------------
             # Filter target month
             # ------------------------------------------------
 
@@ -1435,6 +1648,20 @@ def _scrape_shiksha_once(attempt: int) -> Tuple[List[Dict[str, str]], bool]:
                         "block is most likely IP-reputation based — "
                         "configure PROXY_SERVER to route around it."
                     )
+                elif raw_events:
+                    logger.warning(
+                        "Reason: %d element(s) were scraped but NONE "
+                        "had a date this scraper could confidently "
+                        "extract for %s. Check the 'raw:' lines above "
+                        "(or .raw_events.json in the debug snapshot) "
+                        "to see the actual label text Shiksha is "
+                        "rendering — that will show exactly what date "
+                        "format/markup needs to be added to "
+                        "extract_date_from_text() or the attribute "
+                        "probe in _DATE_ATTR_PROBE_JS.",
+                        len(raw_events),
+                        TARGET_MONTH,
+                    )
                 else:
                     logger.warning(
                         "Possible reasons: (1) Shiksha has not "
@@ -1444,7 +1671,7 @@ def _scrape_shiksha_once(attempt: int) -> Tuple[List[Dict[str, str]], bool]:
                         "extractors don't cover."
                     )
 
-                _capture_debug_snapshot(page, attempt, blocked)
+                _capture_debug_snapshot(page, attempt, blocked, raw_events)
 
                 return [], blocked
 
