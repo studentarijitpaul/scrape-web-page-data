@@ -1,312 +1,84 @@
 name: Shiksha Exam Calendar — Scrape & Sync
 
-on:
-  push:
-    branches:
-      - main
+# IMPORTANT: this is the ONLY workflow file that should exist in
+# .github/workflows/ for this project. Do not keep a second file that
+# also runs on push/schedule — two workflows scraping and writing to
+# the same Sheet/Calendar on the same triggers will race each other,
+# double-post Chat notifications, and make failures impossible to
+# diagnose from logs alone (which is what happened here).
+#
+# This workflow always runs main.py, never scraper.py or
+# calendar_sync.py directly — main.py is the only entry point that
+# applies the Exam_Name allowlist, diffs old vs new data, and refuses
+# to touch the Sheet/Calendar on a failed/blocked scrape.
 
-  workflow_dispatch:
-    inputs:
-      delete_removed:
-        description: "Delete Calendar events no longer present in the Sheet"
-        required: false
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
+on:
+  workflow_dispatch: {}
 
   schedule:
-    # 03:00 UTC = 08:30 AM IST
-    - cron: "0 3 * * *"
-
+    # 30 4 * * * (UTC) = 10:00 AM IST
+    - cron: "30 4 * * *"
 
 jobs:
-
-  # ============================================================
-  # JOB: SCRAPE -> SHEET -> CALENDAR -> CHAT (single entry point)
-  # ============================================================
-  # main.py is the orchestrator: it scrapes, filters against the
-  # Exam_Name allowlist, diffs against what's currently in the sheet
-  # (new / updated / unchanged / removed), writes the sheet, syncs the
-  # Calendar, and posts a Chat message for every new or changed exam.
-  # Do NOT call scraper.py or calendar_sync.py directly here - they
-  # skip the diffing step in change_detector.py and main.py's
-  # per-exam Chat notifications entirely.
   sync:
     name: Scrape, Sync Sheet/Calendar, Notify Chat
     runs-on: ubuntu-22.04
 
     env:
       TZ: Asia/Kolkata
+      TARGET_MONTH: August 2026
 
     steps:
-
-      # --------------------------------------------------------
-      # Checkout repository
-      # --------------------------------------------------------
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # --------------------------------------------------------
-      # Setup Python
-      # --------------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
-          cache-dependency-path: ET/requirements.txt
+          cache-dependency-path: requirements.txt
 
-      # --------------------------------------------------------
-      # Install dependencies
-      # --------------------------------------------------------
       - name: Install Python Dependencies
-        working-directory: ET
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --------------------------------------------------------
-      # Install Playwright Chromium (needed by scraper.scrape_shiksha,
-      # which main.py imports and calls)
-      # --------------------------------------------------------
       - name: Install Playwright Browser
-        working-directory: ET
-        run: |
-          playwright install --with-deps chromium
+        run: playwright install --with-deps chromium
 
-      # --------------------------------------------------------
-      # Check required GitHub Secrets
-      # --------------------------------------------------------
       - name: Check Required Secrets
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
-          GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
         run: |
           echo "Checking required configuration..."
+          missing=0
+          [ -z "$GOOGLE_SERVICE_ACCOUNT_JSON" ] && echo "ERROR: GOOGLE_SERVICE_ACCOUNT_JSON is missing." && missing=1
+          [ -z "$GOOGLE_SHEET_ID" ] && echo "ERROR: GOOGLE_SHEET_ID is missing." && missing=1
+          [ -z "$GOOGLE_CALENDAR_ID" ] && echo "ERROR: GOOGLE_CALENDAR_ID is missing." && missing=1
+          if [ "$missing" -eq 1 ]; then exit 1; fi
+          echo "All required secrets are configured."
 
-          if [ -z "$GOOGLE_SERVICE_ACCOUNT_JSON" ]; then
-            echo "ERROR: GOOGLE_SERVICE_ACCOUNT_JSON secret is missing."
-            exit 1
-          fi
-
-          if [ -z "$GOOGLE_SHEET_ID" ]; then
-            echo "ERROR: GOOGLE_SHEET_ID secret is missing."
-            exit 1
-          fi
-
-          if [ -z "$GOOGLE_CALENDAR_ID" ]; then
-            echo "ERROR: GOOGLE_CALENDAR_ID secret is missing."
-            exit 1
-          fi
-
-          if [ -z "$GOOGLE_CHAT_WEBHOOK_URL" ]; then
-            echo "WARNING: GOOGLE_CHAT_WEBHOOK_URL secret is missing. The sync will still run, but no Chat notifications will be sent (google_chat.py fails soft)."
-          fi
-
-          echo "GOOGLE_SERVICE_ACCOUNT_JSON: configured"
-          echo "GOOGLE_SHEET_ID: configured"
-          echo "GOOGLE_CALENDAR_ID: configured"
-
-      # --------------------------------------------------------
-      # Validate Calendar ID
-      # --------------------------------------------------------
-      - name: Validate Google Calendar ID
-        env:
-          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
-        run: |
-          CALENDAR_ID="$(printf '%s' "$GOOGLE_CALENDAR_ID" | tr -d '\r\n' | xargs)"
-
-          echo "Calendar ID present: true"
-          echo "Calendar ID length: ${#CALENDAR_ID}"
-
-          if [ -z "$CALENDAR_ID" ]; then
-            echo "ERROR: GOOGLE_CALENDAR_ID is empty."
-            exit 1
-          fi
-
-          case "$CALENDAR_ID" in
-            *@group.calendar.google.com)
-              echo "Calendar ID format: OK"
-              ;;
-            *)
-              echo "WARNING: Calendar ID does not end with @group.calendar.google.com."
-              echo "This may still be valid for some Google Calendars."
-              ;;
-          esac
-
-      # --------------------------------------------------------
-      # Test Google Calendar access
-      # --------------------------------------------------------
-      - name: Test Google Calendar Access
-        working-directory: ET
-        env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
-        run: |
-          python - <<'PY'
-          import os
-          import json
-          import sys
-
-          from google.oauth2.service_account import Credentials
-          from googleapiclient.discovery import build
-          from googleapiclient.errors import HttpError
-
-
-          print("==========================================")
-          print("Testing Google Calendar access")
-          print("==========================================")
-
-
-          # ----------------------------------------------------
-          # Read Calendar ID
-          # ----------------------------------------------------
-          calendar_id = os.environ.get("GOOGLE_CALENDAR_ID", "").strip()
-
-          if not calendar_id:
-              print("ERROR: GOOGLE_CALENDAR_ID is empty.")
-              sys.exit(1)
-
-
-          # ----------------------------------------------------
-          # Read service account credentials
-          # ----------------------------------------------------
-          service_account_json = os.environ.get(
-              "GOOGLE_SERVICE_ACCOUNT_JSON",
-              ""
-          ).strip()
-
-          if not service_account_json:
-              print("ERROR: GOOGLE_SERVICE_ACCOUNT_JSON is empty.")
-              sys.exit(1)
-
-
-          try:
-              credentials_info = json.loads(service_account_json)
-          except json.JSONDecodeError as e:
-              print("ERROR: GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.")
-              print(e)
-              sys.exit(1)
-
-
-          # ----------------------------------------------------
-          # Create Google credentials
-          # ----------------------------------------------------
-          credentials = Credentials.from_service_account_info(
-              credentials_info,
-              scopes=[
-                  "https://www.googleapis.com/auth/calendar"
-              ]
-          )
-
-
-          # ----------------------------------------------------
-          # Build Calendar API client
-          # ----------------------------------------------------
-          service = build(
-              "calendar",
-              "v3",
-              credentials=credentials,
-              cache_discovery=False
-          )
-
-
-          # ----------------------------------------------------
-          # Test calendar access
-          # ----------------------------------------------------
-          try:
-
-              calendar = service.calendars().get(
-                  calendarId=calendar_id
-              ).execute()
-
-              print("")
-              print("Google Calendar connection successful!")
-              print("")
-              print("Calendar Name:")
-              print(calendar.get("summary"))
-
-              print("")
-              print("Calendar ID:")
-              print(calendar.get("id"))
-
-              print("")
-              print("Calendar Timezone:")
-              print(calendar.get("timeZone"))
-
-              print("")
-              print("Calendar Access Test: PASSED")
-              print("")
-
-          except HttpError as e:
-
-              print("")
-              print("ERROR: Unable to access Google Calendar.")
-              print("")
-              print("HTTP Status:", e.resp.status)
-              print("Details:", e)
-              print("")
-              print("Make sure:")
-              print("1. GOOGLE_CALENDAR_ID is correct.")
-              print("2. The calendar is shared with the service account.")
-              print("3. The service account has 'Make changes to events' permission.")
-              print("4. Google Calendar API is enabled.")
-              print("")
-
-              sys.exit(1)
-
-          except Exception as e:
-
-              print("")
-              print("ERROR:", str(e))
-              print("")
-
-              sys.exit(1)
-
-          PY
-
-      # --------------------------------------------------------
-      # Run the full pipeline: scrape -> diff -> Sheet -> Calendar -> Chat
-      # --------------------------------------------------------
       - name: Run Sync (main.py)
-        working-directory: ET
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
           GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
-
-          SYNC_TIMEZONE: Asia/Kolkata
-
           DELETE_REMOVED_EVENTS: ${{ github.event.inputs.delete_removed || 'false' }}
+        run: python main.py
 
-        run: |
-          echo "=========================================="
-          echo "Starting scrape -> Sheet -> Calendar -> Chat sync"
-          echo "=========================================="
-
-          python main.py
-
-          echo ""
-          echo "=========================================="
-          echo "Sync completed"
-          echo "=========================================="
-
-      # --------------------------------------------------------
-      # If the scraper found zero events on every retry, it saves a
-      # screenshot + HTML dump of what it actually saw. Upload those
-      # so a failure can be diagnosed from the Actions run itself
-      # (e.g. a Cloudflare challenge page) instead of guessing.
-      # --------------------------------------------------------
+      # If a scrape attempt returns zero events, scraper.py saves a
+      # screenshot + HTML dump of what it actually received. Upload
+      # those so a 403/block can be diagnosed from the run itself
+      # instead of guessing.
       - name: Upload Scraper Debug Snapshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scraper-debug-snapshot
-          path: ET/debug_artifacts/
+          path: debug_artifacts/
           if-no-files-found: ignore
           retention-days: 14
