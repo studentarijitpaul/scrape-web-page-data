@@ -35,9 +35,33 @@ def main() -> int:
         log.info("Allowed exams: %d", len(allowed))
         if not allowed:
             raise RuntimeError("Exam_Name is empty; refusing to overwrite the month worksheet.")
+
         scraped = scraper.scrape_shiksha()
         if not scraped:
-            raise RuntimeError("Scraper returned no events; refusing to treat this as removals.")
+            # A blocked/empty scrape (e.g. Shiksha returning HTTP 403 to
+            # the runner) is an EXPECTED, recurring condition until the
+            # source-side block clears — not a code defect. The Sheet
+            # and Calendar are deliberately left untouched (same safety
+            # rule as before), a Chat alert still goes out so this
+            # doesn't fail silently, but the workflow run itself is no
+            # longer marked as a failure. Genuine bugs below (bad
+            # credentials, Sheets/Calendar API errors, etc.) still hit
+            # the except block and still return 1.
+            log.warning(
+                "Scraper returned no events; leaving the '%s' worksheet "
+                "and Calendar untouched. This usually means Shiksha (or "
+                "a WAF in front of it) blocked the request — check the "
+                "scraper-debug-snapshot artifact from this run.",
+                TARGET_MONTH,
+            )
+            google_chat.send_failure_message(
+                "Scraper",
+                "No events returned (likely blocked by the source). "
+                "Existing Sheet/Calendar data was NOT modified. "
+                "See the scraper-debug-snapshot artifact for details.",
+            )
+            return 0
+
         candidate_rows = [row for item in scraped if (row := _row_from_scrape(item, allowed))]
         rows = google_sheets.deduplicate_sheet_rows(
             filter_allowed_exams(candidate_rows, allowed)
