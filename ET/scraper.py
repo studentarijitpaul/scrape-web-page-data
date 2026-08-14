@@ -10,6 +10,60 @@ Google Calendar synchronization should be handled separately by:
 
     calendar_sync.py
 
+--------------------------------------------------------------------
+WHY THIS VERSION IS DIFFERENT
+--------------------------------------------------------------------
+The previous version was failing with:
+
+    HTTP status: 403
+    server: AkamaiGHost
+
+on the *initial document request* — before any JavaScript ran, before
+any selector was queried. That means the failure was never a scraping
+/ selector / timing problem. It was Akamai's bot-management layer
+refusing the request outright, almost certainly because:
+
+  1. The request "looked like" an automated headless browser
+     (bundled headless Chromium has a distinct TLS/JS fingerprint,
+     `navigator.webdriver` is true, missing plugins, missing
+     `chrome.runtime`, etc.), and/or
+  2. The source IP (a shared GitHub Actions runner IP) has a bad
+     reputation with Akamai, which many high-traffic sites use to
+     bulk-block datacenter ranges regardless of fingerprint.
+
+Retrying with a fresh browser session (what the old code did) cannot
+fix either cause, because the fingerprint and the source IP are the
+same on every retry. This version fixes what's actually fixable and
+gives you a clear, logged answer for the part that isn't:
+
+  - Uses the real Chrome browser (`channel="chrome"`) instead of the
+    bundled headless Chromium, which Akamai fingerprints far more
+    aggressively.
+  - Patches the standard headless "tells" (`navigator.webdriver`,
+    missing plugins/languages, no `window.chrome`, permissions API
+    behavior) via an init script injected before any page JS runs.
+  - Sends realistic request headers (Accept, Accept-Language,
+    Accept-Encoding, Sec-Fetch-*, Sec-Ch-Ua, Upgrade-Insecure-Requests)
+    that match a real Chrome navigation instead of Playwright's bare
+    defaults.
+  - "Warms up" the session by visiting the Shiksha homepage first
+    (like a real visitor would) before navigating to the exam
+    calendar page, with a referer set accordingly, instead of hitting
+    the deep page cold.
+  - Adds human-like jitter: variable delays, a small mouse move/scroll
+    before reading content.
+  - Supports routing traffic through a proxy (PROXY_SERVER /
+    PROXY_USERNAME / PROXY_PASSWORD env vars). If the block is IP-
+    reputation based rather than fingerprint based, this is the only
+    thing that will actually get you past it — no fingerprint fix can
+    unblock a flagged IP.
+  - Explicitly distinguishes, in the logs and in the Google Chat
+    failure notification, between "still getting blocked at the HTTP
+    level" (fingerprint/IP problem — needs `channel="chrome"` support
+    installed and/or a proxy) vs. "page loaded but no events found"
+    (a real selector/structure problem worth debugging from the saved
+    HTML/screenshot).
+
 Required environment variables:
     GOOGLE_SERVICE_ACCOUNT_JSON
     GOOGLE_SHEET_ID
@@ -19,6 +73,12 @@ Optional environment variables:
     SHIKSHA_URL
     MAX_SCRAPE_ATTEMPTS
     DEBUG_ARTIFACT_DIR
+    HEADLESS                 ("true"/"false", default "true")
+    BROWSER_CHANNEL          (default "chrome"; falls back to bundled
+                               Chromium automatically if not installed)
+    PROXY_SERVER             (e.g. "http://host:port")
+    PROXY_USERNAME
+    PROXY_PASSWORD
 
 Example:
     TARGET_MONTH="August 2026" python scraper.py
@@ -26,6 +86,22 @@ Example:
 GitHub Actions:
     GOOGLE_SERVICE_ACCOUNT_JSON=${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
     GOOGLE_SHEET_ID=${{ secrets.GOOGLE_SHEET_ID }}
+    PROXY_SERVER=${{ secrets.PROXY_SERVER }}          # optional
+    PROXY_USERNAME=${{ secrets.PROXY_USERNAME }}      # optional
+    PROXY_PASSWORD=${{ secrets.PROXY_PASSWORD }}      # optional
+
+IMPORTANT CI setup note:
+    `channel="chrome"` requires the real Chrome binary to be present,
+    not just Playwright's bundled Chromium. In your GitHub Actions
+    workflow, install it with:
+
+        playwright install chrome --with-deps
+
+    (in addition to / instead of `playwright install chromium`). If
+    Chrome isn't installed, this script automatically falls back to
+    bundled Chromium and logs a warning — but bundled Chromium is the
+    more easily fingerprinted option, so getting Chrome installed in
+    CI is the single highest-leverage fix here.
 """
 
 import os
@@ -35,7 +111,7 @@ import time
 import random
 import logging
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -43,6 +119,7 @@ from google.oauth2.service_account import Credentials
 from playwright.sync_api import (
     sync_playwright,
     TimeoutError as PlaywrightTimeoutError,
+    Error as PlaywrightError,
 )
 
 import google_chat
@@ -55,6 +132,11 @@ import google_chat
 SHIKSHA_URL = os.getenv(
     "SHIKSHA_URL",
     "https://www.shiksha.com/engineering/resources/exam-calendar"
+)
+
+SHIKSHA_HOMEPAGE_URL = os.getenv(
+    "SHIKSHA_HOMEPAGE_URL",
+    "https://www.shiksha.com/"
 )
 
 TARGET_MONTH = os.getenv(
@@ -81,23 +163,47 @@ CLEAR_SHEET = os.getenv(
     "true"
 ).lower() == "true"
 
-# Browser settings
-HEADLESS = True
+# ------------------------------------------------------------
+# Browser / anti-detection settings
+# ------------------------------------------------------------
+
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+
+# Prefer real Chrome over bundled headless Chromium — Akamai and most
+# bot-management vendors fingerprint the bundled build much more
+# aggressively (different CDP surface, different JS engine build
+# flags). Falls back automatically if "chrome" isn't installed.
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")
 
 PAGE_TIMEOUT = 60_000
 
-# Random delay settings
-MIN_DELAY = 1.0
-MAX_DELAY = 3.0
+# Random delay settings (seconds)
+MIN_DELAY = 1.5
+MAX_DELAY = 4.0
 
-# Retry settings: a WAF/anti-bot challenge or a slow page load is
-# sometimes transient, so a fresh browser session on the next attempt
-# can succeed even when the previous one didn't. NOTE: if Shiksha (or a
-# CDN/WAF in front of it) is blocking by IP reputation rather than by
-# session/fingerprint, retries from the SAME GitHub Actions runner will
-# keep hitting the same source IP and will keep failing — that's what
-# the response-header logging below is for: it tells you which case
-# you're actually in instead of guessing.
+# A small, realistic pool of desktop Chrome user agents. Rotated per
+# attempt so repeated retries don't all present an identical
+# fingerprint. Kept in sync with recent Chrome versions.
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
+
+# Optional proxy. If the block is IP-reputation based (very plausible
+# for a shared GitHub Actions runner IP hitting a high-traffic Akamai
+# -fronted site), this is the only lever that actually addresses the
+# root cause — fingerprint fixes alone won't unblock a flagged IP.
+PROXY_SERVER = os.getenv("PROXY_SERVER", "").strip()
+PROXY_USERNAME = os.getenv("PROXY_USERNAME", "").strip()
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD", "").strip()
+
+# Retry settings: kept as a safety net for genuinely transient issues
+# (a one-off 5xx, a slow load), but retries alone cannot fix a
+# fingerprint or IP-reputation block — see the module docstring.
 MAX_SCRAPE_ATTEMPTS = int(os.getenv("MAX_SCRAPE_ATTEMPTS", "3"))
 RETRY_BACKOFF_SECONDS = 15
 
@@ -106,6 +212,10 @@ RETRY_BACKOFF_SECONDS = 15
 # vs. a structure change) can be diagnosed from the GitHub Actions run
 # itself instead of guessing. Upload this directory as a CI artifact.
 DEBUG_ARTIFACT_DIR = os.getenv("DEBUG_ARTIFACT_DIR", "debug_artifacts")
+
+# Response codes/patterns that indicate a source/WAF-side block rather
+# than a client-rendering issue.
+BLOCK_STATUS_CODES = {403, 429}
 
 
 # ============================================================
@@ -164,6 +274,14 @@ def validate_configuration() -> None:
         raise RuntimeError(
             "Missing required environment variable(s): "
             + ", ".join(missing)
+        )
+
+    if PROXY_SERVER and not PROXY_SERVER.startswith(
+        ("http://", "https://", "socks5://")
+    ):
+        raise RuntimeError(
+            "PROXY_SERVER must include a scheme, e.g. "
+            "'http://host:port'."
         )
 
 
@@ -342,19 +460,78 @@ def write_to_google_sheet(
 
 
 # ============================================================
-# PLAYWRIGHT
+# PLAYWRIGHT — BROWSER / CONTEXT SETUP
 # ============================================================
+
+# Injected into every new page BEFORE any site JavaScript runs. This
+# patches the standard signals bot-detection scripts check for on a
+# vanilla Playwright/Puppeteer session. It cannot defeat every
+# anti-bot system, but it removes the cheap, common tells.
+STEALTH_INIT_SCRIPT = """
+// navigator.webdriver is the single most-checked automation flag.
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+// Headless/automated sessions often have an empty plugins array.
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5],
+});
+
+// Real Chrome reports a non-empty languages array.
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-IN', 'en-US', 'en'],
+});
+
+// window.chrome is absent on bundled headless builds by default.
+window.chrome = window.chrome || { runtime: {} };
+
+// Permissions API: automated Chrome answers "denied" for notifications
+// even without a prompt shown; real Chrome answers "default".
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : originalQuery(parameters)
+);
+
+// Hide the CDP automation extension surface some detectors probe for.
+Object.defineProperty(navigator, 'webdriver', { get: () => false });
+"""
+
+
+def build_proxy_config() -> Optional[dict]:
+    """
+    Build a Playwright proxy config dict from env vars, or None if no
+    proxy is configured.
+    """
+
+    if not PROXY_SERVER:
+        return None
+
+    proxy_config = {"server": PROXY_SERVER}
+
+    if PROXY_USERNAME:
+        proxy_config["username"] = PROXY_USERNAME
+
+    if PROXY_PASSWORD:
+        proxy_config["password"] = PROXY_PASSWORD
+
+    logger.info(
+        "Routing browser traffic through configured proxy (%s).",
+        PROXY_SERVER,
+    )
+
+    return proxy_config
+
 
 def launch_browser(playwright):
     """
-    Launch Chromium.
+    Launch a real Chrome browser when available (preferred, since it
+    is fingerprinted far less aggressively than bundled headless
+    Chromium), falling back to bundled Chromium if the "chrome"
+    channel isn't installed in this environment.
     """
 
-    logger.info(
-        "Launching headless Chromium..."
-    )
-
-    browser = playwright.chromium.launch(
+    launch_kwargs = dict(
         headless=HEADLESS,
         args=[
             "--no-sandbox",
@@ -362,16 +539,57 @@ def launch_browser(playwright):
             "--disable-dev-shm-usage",
             "--disable-gpu",
             "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--window-size=1440,900",
+            "--lang=en-IN",
         ],
+        proxy=build_proxy_config(),
     )
 
-    return browser
+    if BROWSER_CHANNEL:
+
+        try:
+
+            logger.info(
+                "Launching browser (channel=%s, headless=%s)...",
+                BROWSER_CHANNEL,
+                HEADLESS,
+            )
+
+            return playwright.chromium.launch(
+                channel=BROWSER_CHANNEL,
+                **launch_kwargs,
+            )
+
+        except PlaywrightError as exc:
+
+            logger.warning(
+                "Could not launch channel '%s' (%s). Falling back to "
+                "bundled Chromium — note this is more easily "
+                "fingerprinted by bot detection than real Chrome. "
+                "Install it in CI with: "
+                "`playwright install chrome --with-deps`.",
+                BROWSER_CHANNEL,
+                exc,
+            )
+
+    logger.info(
+        "Launching bundled headless Chromium (headless=%s)...",
+        HEADLESS,
+    )
+
+    return playwright.chromium.launch(**launch_kwargs)
 
 
 def create_browser_context(browser):
     """
-    Create a browser context.
+    Create a browser context configured to look like a normal desktop
+    Chrome visitor from India: matching UA/sec-ch-ua headers, a
+    realistic viewport, IST timezone/locale, and standard navigation
+    headers that Playwright doesn't send by default.
     """
+
+    user_agent = random.choice(USER_AGENTS)
 
     context = browser.new_context(
         viewport={
@@ -380,34 +598,100 @@ def create_browser_context(browser):
         },
         locale="en-IN",
         timezone_id="Asia/Kolkata",
-        user_agent=(
-            "Mozilla/5.0 "
-            "(X11; Linux x86_64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/151.0.0.0 "
-            "Safari/537.36"
-        ),
+        user_agent=user_agent,
+        extra_http_headers={
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,*/*;q=0.8"
+            ),
+            "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        },
     )
 
+    context.add_init_script(STEALTH_INIT_SCRIPT)
+
     return context
+
+
+def human_like_warmup(page) -> None:
+    """
+    A little bit of organic-looking activity before reading page
+    content: small mouse movement + scroll. Cheap, but it means the
+    session isn't 100% static input the instant the DOM is ready,
+    which some behavioral detectors key on.
+    """
+
+    try:
+        page.mouse.move(
+            random.randint(100, 400),
+            random.randint(100, 400),
+        )
+
+        page.mouse.wheel(0, random.randint(200, 600))
+
+    except Exception:
+        # Never let cosmetic jitter break the actual scrape.
+        pass
 
 
 # ============================================================
 # PAGE LOADING
 # ============================================================
 
+def visit_homepage_first(page) -> None:
+    """
+    Warm up the session by visiting the Shiksha homepage before the
+    deep calendar page, the way a real visitor arriving via search or
+    direct navigation would. This gives the site a chance to set
+    normal session cookies and avoids the (more suspicious) pattern of
+    a brand-new browser session requesting a deep internal page with
+    no referer as its very first action.
+    """
+
+    logger.info(
+        "Warming up session via homepage [%s] ...",
+        SHIKSHA_HOMEPAGE_URL,
+    )
+
+    try:
+
+        page.goto(
+            SHIKSHA_HOMEPAGE_URL,
+            wait_until="domcontentloaded",
+            timeout=PAGE_TIMEOUT,
+        )
+
+        human_like_warmup(page)
+
+        random_delay()
+
+    except Exception as exc:
+
+        # A failed warm-up isn't fatal on its own — log it and let the
+        # real navigation attempt (and its own blocked/not-blocked
+        # check) be the source of truth.
+        logger.warning(
+            "Homepage warm-up failed (continuing anyway): %s",
+            exc,
+        )
+
+
 def load_shiksha_page(page) -> bool:
     """
     Load the Shiksha exam calendar page.
 
     Returns True if the response looked like a source/WAF block (403,
-    429, or 5xx on the initial navigation), False otherwise. This
-    matters because a 403 on the very first request means the document
-    itself was refused before any client-side JavaScript ran — no
-    amount of waiting for selectors or scrolling to trigger lazy
-    loading can produce calendar data in that case, because there was
-    never a real calendar page in the response, only a block page.
+    429, or 5xx on the initial navigation), False otherwise. A 403 on
+    the very first request means the document itself was refused
+    before any client-side JavaScript ran — no amount of waiting for
+    selectors or scrolling to trigger lazy loading can produce
+    calendar data in that case, because there was never a real
+    calendar page in the response, only a block page.
     """
 
     logger.info(
@@ -423,6 +707,7 @@ def load_shiksha_page(page) -> bool:
             SHIKSHA_URL,
             wait_until="domcontentloaded",
             timeout=PAGE_TIMEOUT,
+            referer=SHIKSHA_HOMEPAGE_URL,
         )
 
         if response:
@@ -431,7 +716,10 @@ def load_shiksha_page(page) -> bool:
                 response.status
             )
 
-            if response.status in (403, 429) or response.status >= 500:
+            if (
+                response.status in BLOCK_STATUS_CODES
+                or response.status >= 500
+            ):
                 blocked = True
 
                 logger.warning(
@@ -507,6 +795,8 @@ def wait_for_page_content(page) -> None:
             "Continuing with available page content."
         )
 
+    human_like_warmup(page)
+
     random_delay()
 
 
@@ -575,14 +865,6 @@ def extract_fullcalendar_events(page) -> List[Dict[str, str]]:
     script = """
     () => {
         const results = [];
-
-        // ----------------------------------------------------
-        // Look for common FullCalendar instances.
-        // ----------------------------------------------------
-
-        const elements = document.querySelectorAll(
-            '.fc, .fc-view-harness, [class*="calendar"]'
-        );
 
         // ----------------------------------------------------
         // Read rendered event elements.
@@ -1041,7 +1323,7 @@ def _capture_debug_snapshot(page, attempt: int, blocked: bool) -> None:
         logger.warning("Could not save debug snapshot: %s", exc)
 
 
-def _scrape_shiksha_once(attempt: int) -> tuple:
+def _scrape_shiksha_once(attempt: int) -> Tuple[List[Dict[str, str]], bool]:
     """
     Run a single scrape attempt in a fresh browser session.
 
@@ -1068,6 +1350,10 @@ def _scrape_shiksha_once(attempt: int) -> tuple:
         )
 
         try:
+
+            # Visit the homepage first so the session looks like an
+            # organic visit rather than a cold hit on a deep page.
+            visit_homepage_first(page)
 
             blocked = load_shiksha_page(
                 page
@@ -1143,7 +1429,11 @@ def _scrape_shiksha_once(attempt: int) -> tuple:
                     logger.warning(
                         "Reason: the initial page request itself was "
                         "refused (403/429/5xx) — this is a source/WAF "
-                        "block, not a selector or timing problem."
+                        "block, not a selector or timing problem. If "
+                        "this persists after switching to "
+                        "channel=\"chrome\" with stealth patches, the "
+                        "block is most likely IP-reputation based — "
+                        "configure PROXY_SERVER to route around it."
                     )
                 else:
                     logger.warning(
@@ -1176,11 +1466,13 @@ def _scrape_shiksha_once(attempt: int) -> tuple:
 def scrape_shiksha() -> List[Dict[str, str]]:
     """
     Main scraping function. Retries up to MAX_SCRAPE_ATTEMPTS times with
-    a fresh browser session each time, since a Cloudflare/anti-bot
-    challenge or a slow/incomplete page load is often transient and a
-    clean retry frequently succeeds even when the previous attempt
-    didn't. Only returns [] (never raises) after every attempt has been
-    exhausted.
+    a fresh browser session each time. This remains useful for
+    genuinely transient issues (a one-off 5xx, a slow load), but note
+    that it will NOT fix a fingerprint-based or IP-reputation-based
+    block on its own — see the module docstring for what actually
+    addresses that (channel="chrome" + stealth patches + optional
+    proxy). Only returns [] (never raises) after every attempt has
+    been exhausted.
     """
 
     logger.info(
@@ -1194,6 +1486,13 @@ def scrape_shiksha() -> List[Dict[str, str]]:
     logger.info(
         "Target month: %s",
         TARGET_MONTH
+    )
+
+    logger.info(
+        "Browser channel: %s | Headless: %s | Proxy configured: %s",
+        BROWSER_CHANNEL or "bundled chromium",
+        HEADLESS,
+        bool(PROXY_SERVER),
     )
 
     logger.info(
@@ -1228,11 +1527,13 @@ def scrape_shiksha() -> List[Dict[str, str]]:
     if was_blocked:
         logger.warning(
             "At least one attempt was blocked at the HTTP level "
-            "(403/429/5xx). Retrying from the same GitHub Actions "
-            "runner keeps hitting the same source IP, so if this is "
-            "an IP-reputation block, further retries here will not "
-            "help — check debug_artifacts for the exact response "
-            "Shiksha returned."
+            "(403/429/5xx) even with stealth patches and a real "
+            "Chrome channel. This strongly suggests an IP-reputation "
+            "block on the GitHub Actions runner IP rather than a "
+            "fingerprint issue — retrying from the same runner will "
+            "keep hitting the same source IP. Configure PROXY_SERVER "
+            "(and PROXY_USERNAME/PROXY_PASSWORD if needed) to route "
+            "around it, or run this job from a non-datacenter IP."
         )
 
     return []
