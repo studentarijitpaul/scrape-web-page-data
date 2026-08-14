@@ -17,6 +17,8 @@ Required environment variables:
 Optional environment variables:
     TARGET_MONTH
     SHIKSHA_URL
+    MAX_SCRAPE_ATTEMPTS
+    DEBUG_ARTIFACT_DIR
 
 Example:
     TARGET_MONTH="August 2026" python scraper.py
@@ -93,16 +95,16 @@ MAX_DELAY = 3.0
 # can succeed even when the previous one didn't. NOTE: if Shiksha (or a
 # CDN/WAF in front of it) is blocking by IP reputation rather than by
 # session/fingerprint, retries from the SAME GitHub Actions runner will
-# keep hitting the same source IP and will keep failing — see the 403
-# diagnostics captured below.
+# keep hitting the same source IP and will keep failing — that's what
+# the response-header logging below is for: it tells you which case
+# you're actually in instead of guessing.
 MAX_SCRAPE_ATTEMPTS = int(os.getenv("MAX_SCRAPE_ATTEMPTS", "3"))
 RETRY_BACKOFF_SECONDS = 15
 
-# Where to save a screenshot/HTML/response-header dump when a scrape
-# attempt returns zero events, so a failure (blocked page vs. genuinely
-# empty calendar vs. a structure change) can be diagnosed from the
-# GitHub Actions run itself instead of guessing. Uploaded as a CI
-# artifact by the workflow.
+# Where to save a screenshot/HTML dump when a scrape attempt returns
+# zero events, so a failure (blocked page vs. genuinely empty calendar
+# vs. a structure change) can be diagnosed from the GitHub Actions run
+# itself instead of guessing. Upload this directory as a CI artifact.
 DEBUG_ARTIFACT_DIR = os.getenv("DEBUG_ARTIFACT_DIR", "debug_artifacts")
 
 
@@ -399,15 +401,13 @@ def load_shiksha_page(page) -> bool:
     """
     Load the Shiksha exam calendar page.
 
-    Returns True if the response looked like a genuine page load, False
-    if the response status indicates the request was blocked (403/429)
-    or errored server-side (5xx). This distinction matters: a 403 on the
-    very first navigation means the *document itself* was refused by
-    Shiksha or a WAF/CDN in front of it, before any client-side
-    JavaScript ran. No amount of waiting for selectors or scrolling to
-    trigger lazy-loading can produce calendar data in that case, because
-    there was never a real calendar page in the response — only a
-    block/challenge page.
+    Returns True if the response looked like a source/WAF block (403,
+    429, or 5xx on the initial navigation), False otherwise. This
+    matters because a 403 on the very first request means the document
+    itself was refused before any client-side JavaScript ran — no
+    amount of waiting for selectors or scrolling to trigger lazy
+    loading can produce calendar data in that case, because there was
+    never a real calendar page in the response, only a block page.
     """
 
     logger.info(
@@ -447,7 +447,13 @@ def load_shiksha_page(page) -> bool:
                 # doing anything beyond reading headers Playwright
                 # already received.
                 headers = response.headers
-                for header_name in ("server", "cf-ray", "cf-mitigated", "x-akamai-transaction-id", "x-iinfo"):
+                for header_name in (
+                    "server",
+                    "cf-ray",
+                    "cf-mitigated",
+                    "x-akamai-transaction-id",
+                    "x-iinfo",
+                ):
                     if header_name in headers:
                         logger.warning(
                             "[WEBSITE] Response header %s: %s",
@@ -995,18 +1001,20 @@ def clean_events(
 
 def _capture_debug_snapshot(page, attempt: int, blocked: bool) -> None:
     """
-    Save a screenshot + HTML dump + response metadata for the current
-    page state, so a zero-event result can be diagnosed later (blocked
-    page vs. genuinely empty calendar vs. a structure change) without
-    needing to reproduce it. Never raises: a failed debug capture must
-    never mask the real error. Never writes secrets — only page URL,
-    title, and rendered content.
+    Save a screenshot + HTML dump + a short metadata file for the
+    current page state, so a zero-event result can be diagnosed later
+    (blocked page vs. genuinely empty calendar vs. a structure change)
+    without needing to reproduce it. Never raises: a failed debug
+    capture must never mask the real error. Never writes secrets —
+    only the page URL, title, and rendered content.
     """
 
     try:
         os.makedirs(DEBUG_ARTIFACT_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        prefix = os.path.join(DEBUG_ARTIFACT_DIR, f"attempt{attempt}-{stamp}")
+        prefix = os.path.join(
+            DEBUG_ARTIFACT_DIR, f"attempt{attempt}-{stamp}"
+        )
 
         page.screenshot(path=f"{prefix}.png", full_page=True)
 
@@ -1014,12 +1022,17 @@ def _capture_debug_snapshot(page, attempt: int, blocked: bool) -> None:
             fh.write(page.content())
 
         with open(f"{prefix}.txt", "w", encoding="utf-8") as fh:
-            fh.write(f"URL: {page.url}\nTitle: {page.title()}\nLikely blocked: {blocked}\n")
+            fh.write(
+                f"URL: {page.url}\n"
+                f"Title: {page.title()}\n"
+                f"Likely blocked: {blocked}\n"
+            )
 
         logger.warning(
             "Saved debug snapshot for attempt %d to %s(.png/.html/.txt). "
-            "If 'Likely blocked' is True, open the .png first — it will "
-            "usually show a WAF/challenge page rather than the calendar.",
+            "If 'Likely blocked' is True, check the .png first — it "
+            "will usually show a WAF/challenge page rather than the "
+            "calendar.",
             attempt,
             prefix,
         )
@@ -1028,7 +1041,7 @@ def _capture_debug_snapshot(page, attempt: int, blocked: bool) -> None:
         logger.warning("Could not save debug snapshot: %s", exc)
 
 
-def _scrape_shiksha_once(attempt: int) -> tuple[List[Dict[str, str]], bool]:
+def _scrape_shiksha_once(attempt: int) -> tuple:
     """
     Run a single scrape attempt in a fresh browser session.
 
@@ -1134,10 +1147,11 @@ def _scrape_shiksha_once(attempt: int) -> tuple[List[Dict[str, str]], bool]:
                     )
                 else:
                     logger.warning(
-                        "Possible reasons: (1) Shiksha has not published "
-                        "calendar data for this month, (2) the page "
-                        "structure changed, (3) calendar data now loads "
-                        "from an endpoint these extractors don't cover."
+                        "Possible reasons: (1) Shiksha has not "
+                        "published calendar data for this month, "
+                        "(2) the page structure changed, (3) calendar "
+                        "data now loads from an endpoint these "
+                        "extractors don't cover."
                     )
 
                 _capture_debug_snapshot(page, attempt, blocked)
@@ -1161,10 +1175,12 @@ def _scrape_shiksha_once(attempt: int) -> tuple[List[Dict[str, str]], bool]:
 
 def scrape_shiksha() -> List[Dict[str, str]]:
     """
-    Main scraping function. Retries up to MAX_SCRAPE_ATTEMPTS times with a
-    fresh browser session each time. Only returns [] (never raises) after
-    every attempt is exhausted — callers (main.py) treat an empty result
-    as a scrape failure and refuse to touch the Sheet/Calendar.
+    Main scraping function. Retries up to MAX_SCRAPE_ATTEMPTS times with
+    a fresh browser session each time, since a Cloudflare/anti-bot
+    challenge or a slow/incomplete page load is often transient and a
+    clean retry frequently succeeds even when the previous attempt
+    didn't. Only returns [] (never raises) after every attempt has been
+    exhausted.
     """
 
     logger.info(
@@ -1213,10 +1229,10 @@ def scrape_shiksha() -> List[Dict[str, str]]:
         logger.warning(
             "At least one attempt was blocked at the HTTP level "
             "(403/429/5xx). Retrying from the same GitHub Actions "
-            "runner will keep hitting the same source IP, so if this "
-            "is an IP-reputation block, further retries here will not "
-            "help — see debug_artifacts for the exact response Shiksha "
-            "returned."
+            "runner keeps hitting the same source IP, so if this is "
+            "an IP-reputation block, further retries here will not "
+            "help — check debug_artifacts for the exact response "
+            "Shiksha returned."
         )
 
     return []
