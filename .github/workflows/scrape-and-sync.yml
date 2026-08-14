@@ -1,5 +1,4 @@
 name: Shiksha Exam Calendar — Scrape & Sync
-
 # IMPORTANT: this is the ONLY workflow file that should exist in
 # .github/workflows/ for this project. Do not keep a second file that
 # also runs on push/schedule — two workflows scraping and writing to
@@ -15,44 +14,54 @@ name: Shiksha Exam Calendar — Scrape & Sync
 # All application files (main.py, scraper.py, requirements.txt, etc.)
 # live under ET/ in this repo, so every step below runs with
 # working-directory: ET.
-
+#
+# ANTI-BLOCK NOTE: scraper.py launches the browser with
+# channel="chrome" by default (real Chrome fingerprints far less
+# aggressively with Akamai than bundled headless Chromium — see
+# scraper.py's module docstring). That requires the actual Chrome
+# binary, not just Playwright's bundled Chromium, so the install step
+# below installs both: chrome as the preferred channel, chromium as
+# the automatic fallback scraper.py uses if "chrome" isn't available
+# for any reason. If PROXY_SERVER/PROXY_USERNAME/PROXY_PASSWORD
+# secrets are present, scraper.py routes all browser traffic through
+# that proxy instead of the runner's own IP — see PROXY_SETUP.md.
 on:
   workflow_dispatch: {}
-
   schedule:
     # 30 4 * * * (UTC) = 10:00 AM IST
     - cron: "30 4 * * *"
-
 jobs:
   sync:
     name: Scrape, Sync Sheet/Calendar, Notify Chat
     runs-on: ubuntu-22.04
-
     env:
       TZ: Asia/Kolkata
       TARGET_MONTH: August 2026
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
           cache-dependency-path: ET/requirements.txt
-
       - name: Install Python Dependencies
         working-directory: ET
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
-      - name: Install Playwright Browser
+      - name: Install Playwright Browsers
         working-directory: ET
-        run: playwright install --with-deps chromium
-
+        run: |
+          # "chrome" is the real Chrome binary scraper.py prefers
+          # (channel="chrome") since it's fingerprinted far less
+          # aggressively by Akamai than bundled headless Chromium.
+          # "chromium" is installed too as the automatic fallback
+          # scraper.py uses if the chrome channel launch fails for
+          # any reason — see scraper.py's launch_browser().
+          playwright install --with-deps chrome
+          playwright install --with-deps chromium
       - name: Check Required Secrets
         env:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -66,7 +75,17 @@ jobs:
           [ -z "$GOOGLE_CALENDAR_ID" ] && echo "ERROR: GOOGLE_CALENDAR_ID is missing." && missing=1
           if [ "$missing" -eq 1 ]; then exit 1; fi
           echo "All required secrets are configured."
-
+      - name: Check Optional Proxy Secrets
+        env:
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+        run: |
+          if [ -z "$PROXY_SERVER" ]; then
+            echo "PROXY_SERVER not set — scraper.py will make requests directly from this runner's IP."
+            echo "If Shiksha is IP-reputation-blocking the shared GitHub Actions pool, set PROXY_SERVER"
+            echo "(and PROXY_USERNAME/PROXY_PASSWORD if your proxy needs auth) to route around it. See PROXY_SETUP.md."
+          else
+            echo "PROXY_SERVER is set — scraper.py will route browser traffic through it."
+          fi
       - name: Run Sync (main.py)
         working-directory: ET
         env:
@@ -75,8 +94,13 @@ jobs:
           GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
           GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
           DELETE_REMOVED_EVENTS: ${{ github.event.inputs.delete_removed || 'false' }}
+          # Optional — leave the secrets unset in the repo to run
+          # without a proxy. See scraper.py's module docstring and
+          # PROXY_SETUP.md for when/why to set these.
+          PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+          PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
         run: python main.py
-
       # If a scrape attempt returns zero events, scraper.py saves a
       # screenshot + HTML dump of what it actually received. Upload
       # those so a 403/block can be diagnosed from the run itself
