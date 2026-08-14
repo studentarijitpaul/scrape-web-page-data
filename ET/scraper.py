@@ -1011,6 +1011,115 @@ el => {
 
 
 # ============================================================
+# SHIKSHA TABLE EXTRACTION (PRIMARY)
+# ============================================================
+
+def extract_shiksha_table_events(page) -> List[Dict[str, str]]:
+    """Extract events from Shiksha's rendered Date/Label/Event table.
+
+    Shiksha currently renders the calendar as a normal HTML table rather
+    than as FullCalendar events.  The Date cell is populated only when the
+    date changes; subsequent rows inherit the most recent date.  This
+    extractor deliberately targets the table header instead of fragile CSS
+    class names so minor frontend class changes do not break the scraper.
+    """
+    logger.info("Attempting Shiksha Date/Label/Event table extraction...")
+
+    script = r"""
+    () => {
+        const clean = value => (value || '').replace(/\\s+/g, ' ').trim();
+        const norm = value => clean(value).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+        const tables = Array.from(document.querySelectorAll('table'));
+        const output = [];
+
+        for (const table of tables) {
+            const rows = Array.from(table.querySelectorAll('tr'));
+            if (!rows.length) continue;
+
+            let headerIndex = -1;
+            let dateIndex = -1;
+            let labelIndex = -1;
+            let eventIndex = -1;
+
+            for (let i = 0; i < Math.min(rows.length, 10); i++) {
+                const cells = Array.from(rows[i].querySelectorAll('th,td')).map(c => clean(c.innerText));
+                const normalized = cells.map(norm);
+                const d = normalized.indexOf('date');
+                const l = normalized.indexOf('label');
+                const e = normalized.indexOf('event');
+                if (d !== -1 && l !== -1 && e !== -1) {
+                    headerIndex = i;
+                    dateIndex = d;
+                    labelIndex = l;
+                    eventIndex = e;
+                    break;
+                }
+            }
+
+            if (headerIndex === -1) continue;
+
+            let currentDate = '';
+            for (const row of rows.slice(headerIndex + 1)) {
+                const cells = Array.from(row.querySelectorAll('td,th')).map(c => clean(c.innerText));
+                if (!cells.length) continue;
+
+                const explicitDate = clean(cells[dateIndex] || '');
+                const label = clean(cells[labelIndex] || '');
+                const event = clean(cells[eventIndex] || '');
+
+                // Ignore non-data rows and modal/UI fragments.
+                if (!label && !event && !explicitDate) continue;
+                if (norm(label) === 'label' && norm(event) === 'event') continue;
+
+                if (explicitDate) currentDate = explicitDate;
+
+                // Some versions put the date in a data attribute instead.
+                if (!currentDate) {
+                    const candidate = row.getAttribute('data-date')
+                        || row.querySelector('[data-date]')?.getAttribute('data-date')
+                        || row.querySelector('time[datetime]')?.getAttribute('datetime')
+                        || '';
+                    if (candidate) currentDate = clean(candidate);
+                }
+
+                if (!currentDate || (!label && !event)) continue;
+
+                output.push({
+                    date: currentDate,
+                    label: label,
+                    Event: event,
+                });
+            }
+        }
+
+        return output;
+    }
+    """
+
+    try:
+        events = page.evaluate(script)
+    except Exception as exc:
+        logger.warning("Shiksha table extraction failed: %s", exc)
+        return []
+
+    if not isinstance(events, list):
+        return []
+
+    normalized = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        date = normalize_date(str(event.get("date", "")))
+        label = re.sub(r"\s+", " ", str(event.get("label", ""))).strip()
+        event_text = re.sub(r"\s+", " ", str(event.get("Event", ""))).strip()
+        if date and (label or event_text):
+            normalized.append({"date": date, "label": label, "Event": event_text})
+
+    logger.info("Shiksha table rows found: %d", len(normalized))
+    return normalized
+
+
+# ============================================================
 # FULLCALENDAR EXTRACTION
 # ============================================================
 
@@ -1548,12 +1657,18 @@ def _scrape_shiksha_once(attempt: int) -> Tuple[List[Dict[str, str]], bool]:
             )
 
             # ------------------------------------------------
-            # Try FullCalendar extraction
+            # Shiksha's current page is a Date/Label/Event HTML table.
+            # This is the primary extractor.
             # ------------------------------------------------
 
-            events = extract_fullcalendar_events(
-                page
-            )
+            events = extract_shiksha_table_events(page)
+
+            # ------------------------------------------------
+            # Legacy FullCalendar extraction
+            # ------------------------------------------------
+
+            if not events:
+                events = extract_fullcalendar_events(page)
 
             # ------------------------------------------------
             # DOM fallback
