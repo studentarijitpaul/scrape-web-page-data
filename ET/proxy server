@@ -1,0 +1,436 @@
+"""
+Custom Forward Proxy Server
+============================
+
+Purpose:
+    A minimal, self-hosted HTTP/HTTPS forward proxy you run on your own
+    VPS. Point scraper.py's PROXY_SERVER at it so Shiksha/Akamai sees
+    the VPS's IP instead of the shared GitHub Actions runner IP.
+
+WHY THIS HELPS (and its limits):
+    GitHub Actions runner IPs are shared across thousands of unrelated
+    jobs and are heavily blocklisted by high-traffic sites/WAFs — an
+    IP-reputation block there has nothing to do with your code. Moving
+    the actual outbound request to a VPS you control takes it out of
+    that specific blocklisted pool.
+
+    It is still a datacenter/cloud IP, though. If Akamai's rule is
+    "block datacenter ASNs in general" rather than "block this
+    specific shared pool," this proxy alone won't get past it — that
+    tier of blocking only yields to a residential or mobile-carrier
+    IP, which requires a paid proxy service rather than a VPS you spin
+    up yourself. Try this first since it's free; if scraper.py still
+    logs a 403 with this proxy configured, that's your answer.
+
+How it works:
+    - Plain HTTP requests are forwarded directly.
+    - HTTPS requests are tunneled via the standard CONNECT method, so
+      TLS is still negotiated end-to-end between the browser and the
+      target site — this proxy never sees decrypted HTTPS traffic or
+      terminates TLS itself.
+    - Optional username/password auth via the standard
+      Proxy-Authorization: Basic header, checked against
+      PROXY_AUTH_USERNAME / PROXY_AUTH_PASSWORD. Leave both unset to
+      run without auth (fine if you firewall the port to only your
+      scraper's IP; NOT fine on an open port on the public internet).
+
+Environment variables:
+    PROXY_LISTEN_HOST     default "0.0.0.0"
+    PROXY_LISTEN_PORT     default "8080"
+    PROXY_AUTH_USERNAME    optional
+    PROXY_AUTH_PASSWORD    optional
+    PROXY_ALLOWED_HOSTS    optional comma-separated allowlist, e.g.
+                           "shiksha.com,www.shiksha.com" — if set,
+                           only CONNECT/requests to these hosts (or
+                           their subdomains) are permitted. Strongly
+                           recommended for an open forward proxy, so
+                           it can't be repurposed as a general-purpose
+                           open relay if the credentials ever leak.
+
+Run directly:
+    PROXY_AUTH_USERNAME=myuser \\
+    PROXY_AUTH_PASSWORD=mypass \\
+    PROXY_ALLOWED_HOSTS=shiksha.com,www.shiksha.com \\
+    python3 proxy_server.py
+
+Then in scraper.py's environment:
+    PROXY_SERVER=http://YOUR_VPS_IP:8080
+    PROXY_USERNAME=myuser
+    PROXY_PASSWORD=mypass
+
+See PROXY_SETUP.md for systemd / Docker / firewall deployment steps.
+"""
+
+import asyncio
+import base64
+import logging
+import os
+import socket
+from typing import Optional, Tuple
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+LISTEN_HOST = os.getenv("PROXY_LISTEN_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.getenv("PROXY_LISTEN_PORT", "8080"))
+
+AUTH_USERNAME = os.getenv("PROXY_AUTH_USERNAME", "").strip()
+AUTH_PASSWORD = os.getenv("PROXY_AUTH_PASSWORD", "").strip()
+AUTH_REQUIRED = bool(AUTH_USERNAME or AUTH_PASSWORD)
+
+_allowed_raw = os.getenv("PROXY_ALLOWED_HOSTS", "").strip()
+ALLOWED_HOSTS = {
+    h.strip().lower() for h in _allowed_raw.split(",") if h.strip()
+} or None  # None = allow any host
+
+CONNECT_TIMEOUT = 15
+IDLE_BUFFER_SIZE = 65536
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+logger = logging.getLogger("proxy_server")
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def host_is_allowed(host: str) -> bool:
+    """
+    Check a target host against PROXY_ALLOWED_HOSTS, if configured.
+    Matches the host itself or any subdomain of an allowed entry.
+    """
+
+    if ALLOWED_HOSTS is None:
+        return True
+
+    host = host.lower()
+
+    for allowed in ALLOWED_HOSTS:
+        if host == allowed or host.endswith("." + allowed):
+            return True
+
+    return False
+
+
+def check_proxy_auth(headers: dict) -> bool:
+    """
+    Validate the Proxy-Authorization header against configured
+    credentials. Returns True if auth passes (or isn't required).
+    """
+
+    if not AUTH_REQUIRED:
+        return True
+
+    auth_header = headers.get("proxy-authorization", "")
+
+    if not auth_header.lower().startswith("basic "):
+        return False
+
+    try:
+        encoded = auth_header.split(" ", 1)[1].strip()
+        decoded = base64.b64decode(encoded).decode("utf-8", "replace")
+        supplied_user, _, supplied_pass = decoded.partition(":")
+
+    except Exception:
+        return False
+
+    return (
+        supplied_user == AUTH_USERNAME
+        and supplied_pass == AUTH_PASSWORD
+    )
+
+
+async def _read_headers(
+    reader: asyncio.StreamReader,
+) -> Tuple[str, dict, bytes]:
+    """
+    Read a request line + headers from the client. Returns
+    (request_line, headers_dict, raw_header_bytes).
+    """
+
+    raw = b""
+
+    while b"\r\n\r\n" not in raw:
+        chunk = await reader.read(IDLE_BUFFER_SIZE)
+        if not chunk:
+            break
+        raw += chunk
+
+        if len(raw) > 1_000_000:
+            raise ValueError("Header block too large")
+
+    head, _, _ = raw.partition(b"\r\n\r\n")
+    lines = head.decode("iso-8859-1").split("\r\n")
+
+    request_line = lines[0] if lines else ""
+
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            key, _, value = line.partition(":")
+            headers[key.strip().lower()] = value.strip()
+
+    return request_line, headers, raw
+
+
+async def _pipe(
+    src: asyncio.StreamReader,
+    dst: asyncio.StreamWriter,
+) -> None:
+    """
+    Copy bytes from src to dst until EOF, used for tunneling both
+    directions of a CONNECT (HTTPS) session.
+    """
+
+    try:
+        while True:
+            data = await src.read(IDLE_BUFFER_SIZE)
+            if not data:
+                break
+            dst.write(data)
+            await dst.drain()
+
+    except (ConnectionResetError, BrokenPipeError):
+        pass
+
+    finally:
+        try:
+            dst.close()
+        except Exception:
+            pass
+
+
+def _parse_connect_target(request_line: str) -> Optional[Tuple[str, int]]:
+    """
+    Parse 'CONNECT host:port HTTP/1.1' into (host, port).
+    """
+
+    parts = request_line.split(" ")
+
+    if len(parts) < 2:
+        return None
+
+    target = parts[1]
+
+    if ":" in target:
+        host, _, port_str = target.rpartition(":")
+        try:
+            return host, int(port_str)
+        except ValueError:
+            return None
+
+    return target, 443
+
+
+# ============================================================
+# CONNECTION HANDLER
+# ============================================================
+
+async def handle_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
+
+    peer = writer.get_extra_info("peername")
+
+    try:
+        request_line, headers, raw_prefix = await _read_headers(reader)
+    except Exception as exc:
+        logger.warning("[%s] Failed to read request: %s", peer, exc)
+        writer.close()
+        return
+
+    if not request_line:
+        writer.close()
+        return
+
+    if not check_proxy_auth(headers):
+        logger.warning(
+            "[%s] Auth failed or missing for request: %s", peer, request_line
+        )
+        writer.write(
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+            b'Proxy-Authenticate: Basic realm="proxy"\r\n'
+            b"Content-Length: 0\r\n\r\n"
+        )
+        await writer.drain()
+        writer.close()
+        return
+
+    method = request_line.split(" ")[0] if request_line else ""
+
+    if method == "CONNECT":
+        await _handle_connect(request_line, reader, writer, peer)
+    else:
+        await _handle_plain_http(
+            request_line, headers, raw_prefix, reader, writer, peer
+        )
+
+
+async def _handle_connect(
+    request_line: str,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    peer,
+) -> None:
+    """
+    Handle HTTPS traffic via CONNECT tunneling. TLS is negotiated
+    end-to-end between the client (Playwright/Chrome) and the target
+    site; this proxy only relays opaque bytes after the tunnel opens.
+    """
+
+    target = _parse_connect_target(request_line)
+
+    if target is None:
+        writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        await writer.drain()
+        writer.close()
+        return
+
+    host, port = target
+
+    if not host_is_allowed(host):
+        logger.warning("[%s] Blocked CONNECT to disallowed host: %s", peer, host)
+        writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+        await writer.drain()
+        writer.close()
+        return
+
+    try:
+        remote_reader, remote_writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=CONNECT_TIMEOUT,
+        )
+
+    except (OSError, asyncio.TimeoutError, socket.gaierror) as exc:
+        logger.warning("[%s] CONNECT to %s:%s failed: %s", peer, host, port, exc)
+        writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        await writer.drain()
+        writer.close()
+        return
+
+    logger.info("[%s] CONNECT tunnel established to %s:%s", peer, host, port)
+
+    writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+    await writer.drain()
+
+    await asyncio.gather(
+        _pipe(reader, remote_writer),
+        _pipe(remote_reader, writer),
+        return_exceptions=True,
+    )
+
+
+async def _handle_plain_http(
+    request_line: str,
+    headers: dict,
+    raw_prefix: bytes,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    peer,
+) -> None:
+    """
+    Handle plain (non-HTTPS) HTTP requests by forwarding them to the
+    target host and relaying the response back.
+    """
+
+    host_header = headers.get("host", "")
+
+    if not host_header:
+        writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        await writer.drain()
+        writer.close()
+        return
+
+    if ":" in host_header:
+        host, _, port_str = host_header.partition(":")
+        port = int(port_str) if port_str.isdigit() else 80
+    else:
+        host, port = host_header, 80
+
+    if not host_is_allowed(host):
+        logger.warning("[%s] Blocked HTTP request to disallowed host: %s", peer, host)
+        writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+        await writer.drain()
+        writer.close()
+        return
+
+    try:
+        remote_reader, remote_writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port),
+            timeout=CONNECT_TIMEOUT,
+        )
+
+    except (OSError, asyncio.TimeoutError, socket.gaierror) as exc:
+        logger.warning("[%s] Forward to %s:%s failed: %s", peer, host, port, exc)
+        writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        await writer.drain()
+        writer.close()
+        return
+
+    logger.info("[%s] Forwarding %s to %s:%s", peer, request_line, host, port)
+
+    # Strip hop-by-hop proxy headers before forwarding, then replay
+    # everything already read plus whatever remains (e.g. a POST body).
+    remote_writer.write(raw_prefix)
+    await remote_writer.drain()
+
+    await asyncio.gather(
+        _pipe(reader, remote_writer),
+        _pipe(remote_reader, writer),
+        return_exceptions=True,
+    )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+async def main() -> None:
+
+    server = await asyncio.start_server(
+        handle_client, LISTEN_HOST, LISTEN_PORT
+    )
+
+    logger.info("==================================================")
+    logger.info("Custom forward proxy listening on %s:%d", LISTEN_HOST, LISTEN_PORT)
+    logger.info("Auth required: %s", AUTH_REQUIRED)
+    logger.info(
+        "Allowed hosts: %s",
+        ", ".join(sorted(ALLOWED_HOSTS)) if ALLOWED_HOSTS else "ANY (not restricted)",
+    )
+    logger.info("==================================================")
+
+    if not AUTH_REQUIRED:
+        logger.warning(
+            "No PROXY_AUTH_USERNAME/PROXY_AUTH_PASSWORD set — this proxy "
+            "is open to anyone who can reach it. Restrict it with a "
+            "firewall rule (allow only your scraper's IP) or set "
+            "credentials."
+        )
+
+    if ALLOWED_HOSTS is None:
+        logger.warning(
+            "PROXY_ALLOWED_HOSTS not set — this proxy will relay traffic "
+            "to any destination. Set it to restrict this proxy to only "
+            "the hosts your scraper needs."
+        )
+
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down.")
